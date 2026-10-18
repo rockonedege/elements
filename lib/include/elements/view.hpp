@@ -1,26 +1,32 @@
 /*=============================================================================
-   Copyright (c) 2016-2020 Joel de Guzman
+   Copyright (c) 2016-2023 Joel de Guzman
 
    Distributed under the MIT License [ https://opensource.org/licenses/MIT ]
 =============================================================================*/
 #if !defined(ELEMENTS_VIEW_AUGUST_15_2016)
 #define ELEMENTS_VIEW_AUGUST_15_2016
 
+#include <infra/support.hpp>
 #include <elements/base_view.hpp>
-#include <elements/support/rect.hpp>
-#include <elements/support/canvas.hpp>
-#include <elements/support/theme.hpp>
-#include <elements/element/element.hpp>
+#include <artist/rect.hpp>
+#include <artist/canvas.hpp>
 #include <elements/element/layer.hpp>
 #include <elements/element/size.hpp>
 #include <elements/element/indirect.hpp>
+#include <elements/support/context.hpp>
+#include <elements/model.hpp>
+
 #include <asio.hpp>
 #include <memory>
 #include <unordered_map>
 #include <chrono>
+#include <stack>
 #include <map>
+#include <mutex>
+#include <utility>
+#include <vector>
 
-namespace cycfi { namespace elements
+namespace cycfi::elements
 {
    class context;
    class window;
@@ -31,18 +37,25 @@ namespace cycfi { namespace elements
    public:
                               view(extent size_);
                               view(host_view_handle h);
+#if defined(ELEMENTS_HOST_UI_LIBRARY_X11)
+                              view(unsigned long parent);
+#endif
                               view(window& win);
                               ~view();
 
-      void                    draw(cairo_t* ctx, rect area) override;
+      void                    draw(canvas& cnv) override;
       void                    click(mouse_button btn) override;
       void                    drag(mouse_button btn) override;
       void                    cursor(point p, cursor_tracking status) override;
       void                    scroll(point dir, point p) override;
       bool                    key(key_info const& k) override;
       bool                    text(text_info const& info) override;
+      void                    composition(composition_info const& info) override;
       void                    begin_focus() override;
       void                    end_focus() override;
+      void                    relinquish_focus();
+      void                    track_drop(drop_info const& info, cursor_tracking status) override;
+      bool                    drop(drop_info const& info) override;
       void                    poll() override;
 
       void                    layout();
@@ -52,14 +65,22 @@ namespace cycfi { namespace elements
 
       void                    refresh() override;
       void                    refresh(rect area) override;
+      void                    refresh(context const& ctx, rect area);
       void                    refresh(element& element, int outward = 0);
       void                    refresh(context const& ctx, int outward = 0);
-      rect                    dirty() const;
 
+      void                    on_open(extent size_, float scale) override;
+      void                    on_size_change(extent size_) override;
+      void                    on_scale_change(float scale) override;
+      void                    on_close() override;
+
+      // A pair of functions that undo and redo a change. Each returns
+      // false if the change no longer applies, its element or part gone:
+      // the view then drops it and goes on to the next.
       struct undo_redo_task
       {
-         std::function<void()> undo;
-         std::function<void()> redo;
+         std::function<bool()> undo;
+         std::function<bool()> redo;
       };
 
       void                    add_undo(undo_redo_task t);
@@ -84,7 +105,7 @@ namespace cycfi { namespace elements
 
       using layers_vector = std::vector<element_ptr>;
 
-      void                    add(element_ptr e);
+      void                    add(element_ptr e, bool focus = true);
       void                    remove(element_ptr e);
       void                    move_to_front(element_ptr e);
       void                    move_to_back(element_ptr e);
@@ -100,8 +121,11 @@ namespace cycfi { namespace elements
       using io_context = asio::io_context;
       io_context&             io();
 
+
+      using steady_timer_ptr = std::shared_ptr<asio::steady_timer>;
+
                               template <typename T, typename F>
-      void                    post(T duration, F f);
+      steady_timer_ptr        post(T duration, F f);
 
                               template <typename F>
       void                    post(F f);
@@ -113,6 +137,17 @@ namespace cycfi { namespace elements
 
       void                    manage_on_tracking(element& e, tracking state);
 
+      using context_function = element::context_function;
+      void                    in_context_do(element& e, context_function f);
+
+      /**
+       * \brief
+       *    The links between this view's controls and the application's
+       *    models. They live as long as the view does, and leave the
+       *    models when it goes. See `model_binder`.
+       */
+      model_binder&           bindings() { return _bindings; }
+
    private:
 
       scaled_content          make_scaled_content() { return elements::scale(1.0, link(_content)); }
@@ -121,43 +156,83 @@ namespace cycfi { namespace elements
       scaled_content          _main_element;
 
       void                    set_limits();
+      void                    update_drop_types();
+      void                    update_hotkeys();
+      void                    refresh_pending();
 
-      rect                    _dirty;
+      // The focus held when a mouse button went down: each composite on
+      // the path and its focused child. A layer opened by that click
+      // gives the focus back to it when it closes, not to whatever the
+      // click moved the focus to (a menu bar's title, for instance).
+      using focus_path = std::vector<std::pair<composite_base*, int>>;
+      focus_path              current_focus_path();
+      void                    save_click_focus();
+
+      std::optional<focus_path> _click_focus;
+
+      // Elements to refresh, gathered until the next poll, so that a
+      // burst of them (every control of a preset, loaded at once) costs
+      // one refresh rather than a search of the tree for each. See
+      // refresh_pending.
+      using pending_refresh = std::pair<element*, int>;
+      std::vector<pending_refresh>
+                              _pending;
+      std::mutex              _pending_mutex;
+
       rect                    _current_bounds;
-      view_limits             _current_limits = { { 0, 0 }, { full_extent, full_extent} };
+      std::optional<mime_types> _drop_types;   // as told to the host
+      view_limits             _current_limits = {{0, 0}, { full_extent, full_extent}};
       mouse_button            _current_button;
       bool                    _is_focus = false;
+      uint32_t                _high_surrogate = 0;    // a UTF-16 pair's first half
 
       using undo_stack_type = std::stack<undo_redo_task>;
       undo_stack_type         _undo_stack;
       undo_stack_type         _redo_stack;
 
       io_context              _io;
-      io_context::work        _work;
+      asio::executor_work_guard<io_context::executor_type>        _work;
 
       using time_point = std::chrono::steady_clock::time_point;
       using tracking_map = std::map<element*, time_point>;
 
       tracking_map            _tracking;
+
+      // Last, so it is destroyed first: the controls it refers to are
+      // still there as it disconnects, and so are the models, which must
+      // outlive the view.
+      model_binder            _bindings{[this](element& e) { refresh(e); }};
    };
 
    ////////////////////////////////////////////////////////////////////////////
    // Inlines
    ////////////////////////////////////////////////////////////////////////////
-   inline point cursor_pos(view const& v) // declared in context.hpp
+
+   // The functions below are declared in context.hpp. They are defined here due
+   // to the forward declaration of `view` in the header file, preventing direct
+   // access to the actual `view` class. These functions are explicitly marked
+   // for forced inlining using CYCFI_FORCE_INLINE (defined in infra/support.hpp).
+   //
+   // If you encounter an undefined reference to any of these functions during
+   // the linking phase, it indicates the necessity to include
+   // <elements/view.hpp> in the .hpp or .cpp file of the calling code.
+
+   // declared in context.hpp
+   CYCFI_FORCE_INLINE point cursor_pos(view const& v)
    {
       return v.cursor_pos();
    }
 
-   inline rect view_bounds(view const& v) // declared in context.hpp
+   // declared in context.hpp
+   CYCFI_FORCE_INLINE rect view_bounds(view const& v)
    {
       auto size = v.size();
-      return rect{ 0, 0, size.x, size.y };
+      return rect{0, 0, size.x, size.y};
    }
 
-   inline rect view::dirty() const
+   inline rect basic_context::visible_bounds() const
    {
-      return _dirty;
+      return artist::intersection(view_bounds(), canvas.clip_extent());
    }
 
    inline bool view::has_undo()
@@ -182,9 +257,12 @@ namespace cycfi { namespace elements
 
    inline void view::content(std::initializer_list<element_ptr> list)
    {
+      _content.end_focus();
       _content = list;
       std::reverse(_content.begin(), _content.end());
       set_limits();
+      update_drop_types();
+      update_hotkeys();
    }
 
    namespace detail
@@ -205,28 +283,53 @@ namespace cycfi { namespace elements
    template <typename... E>
    inline void view::content(E&&... elements)
    {
-      _content = { detail::add_element(std::forward<E>(elements))... };
+      _content.end_focus();
+      _content = {detail::add_element(std::forward<E>(elements))...};
       std::reverse(_content.begin(), _content.end());
       set_limits();
+      update_drop_types();
+      update_hotkeys();
    }
 
-   inline void view::add(element_ptr e)
+   inline void view::add(element_ptr e, bool focus_top)
    {
       // We'll defer this call just to be safe, to give the trigger that
       // initiated this call (e.g. button on_click) a chance to return.
       if (e)
       {
-         if (_content.empty()
-            || std::find(_content.begin(), _content.end(), e) != _content.end())
-            return;
-
-         io().post(
-            [e, this]
+         asio::post(io(),
+            [e, this, focus_top]
             {
-               end_focus();
+               // Already one of the layers, even if added since this was
+               // posted: leave it.
+               if (std::find(_content.begin(), _content.end(), e) != _content.end())
+                  return;
+
+               auto wants_focus = focus_top && e->wants_focus();
+               // End the current focus if the new element wants to be the focus.
+               if (wants_focus)
+               {
+                  end_focus();
+                  save_click_focus();
+               }
+
+               // Add the new element to the top and lay it out
                _content.push_back(e);
                layout(*e);
-               begin_focus();
+
+               // Make the new element the new focus if it wants to.
+               if (wants_focus)
+               {
+                  // Restore previous focus or make the top most layer the focus
+                  auto req = focus_top?
+                     element::focus_request::from_top :
+                     element::focus_request::restore_previous
+                     ;
+
+                  _main_element.begin_focus(req);
+                  refresh();
+                  _is_focus = _main_element.focus();
+               }
             }
          );
       }
@@ -240,18 +343,43 @@ namespace cycfi { namespace elements
       // post a function that is called at idle time.
       if (e)
       {
-         io().post(
+         asio::post(io(),
             [e, this]
             {
                auto i = std::find(_content.begin(), _content.end(), e);
                if (i != _content.end())
                {
-                  end_focus();
-                  refresh(*e);
+                  // Relinquish the focus if the element to be removed is
+                  // the current focus
+                  auto ix = i - _content.begin();
+                  bool const had_focus = _content.focus_index() == ix;
+                  if (had_focus)
+                     relinquish_focus();
+
+                  // Remove the element.
                   _content.erase(i);
-                  _content.reset();
+
+                  // Lay it out
                   layout();
-                  begin_focus();
+
+                  // The focus it had goes to the top-most layer that takes
+                  // one, a menu under a submenu for instance, which then
+                  // has it where it was.
+                  if (had_focus)
+                  {
+                     for (auto j = int(_content.size()) - 1; j >= 0; --j)
+                     {
+                        if (_content.at(j).wants_focus())
+                        {
+                           _content.focus(j);
+                           break;
+                        }
+                     }
+                  }
+                  _main_element.begin_focus(
+                     element::focus_request::restore_previous);
+                  refresh();
+                  _is_focus = _main_element.focus();
                }
             }
          );
@@ -266,9 +394,9 @@ namespace cycfi { namespace elements
 
    inline void view::move_to_front(element_ptr e)
    {
-      if (e && _content.back() != e)
+      if (e && !_content.empty() && _content.back() != e)
       {
-         io().post(
+         asio::post(io(),
             [e, this]
             {
                auto i = std::find(_content.begin(), _content.end(), e);
@@ -287,9 +415,9 @@ namespace cycfi { namespace elements
 
    inline void view::move_to_back(element_ptr e)
    {
-      if (e && _content.front() != e)
+      if (e && !_content.empty() && _content.front() != e)
       {
-         io().post(
+         asio::post(io(),
             [e, this]
             {
                auto i = std::find(_content.begin(), _content.end(), e);
@@ -327,10 +455,10 @@ namespace cycfi { namespace elements
    }
 
    template <typename T, typename F>
-   inline void view::post(T duration, F f)
+   inline view::steady_timer_ptr view::post(T duration, F f)
    {
       auto timer = std::make_shared<asio::steady_timer>(_io);
-      timer->expires_from_now(duration);
+      timer->expires_after(duration);
       timer->async_wait(
          [timer, f](auto const& err)
          {
@@ -338,13 +466,15 @@ namespace cycfi { namespace elements
                f();
          }
       );
+
+      return timer;
    }
 
    template <typename F>
    inline void view::post(F f)
    {
-      _io.post(f);
+      asio::post(_io, f);
    }
-}}
+}
 
 #endif

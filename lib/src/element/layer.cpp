@@ -1,5 +1,5 @@
 /*=============================================================================
-   Copyright (c) 2016-2020 Joel de Guzman
+   Copyright (c) 2016-2023 Joel de Guzman
 
    Distributed under the MIT License [ https://opensource.org/licenses/MIT ]
 =============================================================================*/
@@ -7,14 +7,14 @@
 #include <elements/view.hpp>
 #include <elements/support/context.hpp>
 
-namespace cycfi { namespace elements
+namespace cycfi::elements
 {
    ////////////////////////////////////////////////////////////////////////////
    // Layer
    ////////////////////////////////////////////////////////////////////////////
    view_limits layer_element::limits(basic_context const& ctx) const
    {
-      view_limits limits{ { 0.0, 0.0 }, { full_extent, full_extent } };
+      view_limits limits{{0.0, 0.0}, {full_extent, full_extent}};
       for (std::size_t ix = 0; ix != size();  ++ix)
       {
          auto el = at(ix).limits(ctx);
@@ -36,7 +36,7 @@ namespace cycfi { namespace elements
       for (std::size_t ix = 0; ix != size(); ++ix)
       {
          auto& e = at(ix);
-         e.layout(context{ ctx, &e, bounds_of(ctx, ix) });
+         e.layout(context{ctx, &e, bounds_of(ctx, ix)});
       }
    }
 
@@ -64,13 +64,13 @@ namespace cycfi { namespace elements
             rect bounds = bounds_of(ctx, ix);
             if (bounds.includes(p))
             {
-               context ectx{ ctx, &e, bounds };
-               if (e.hit_test(ectx, p))
-                  return hit_info{ e.shared_from_this(), bounds, int(ix) };
+               context ectx{ctx, &e, bounds};
+               if (auto leaf = e.hit_test(ectx, p, true, control))
+                  return hit_info{&e, leaf, bounds, int(ix)};
             }
          }
       }
-      return hit_info{ {}, rect{}, -1 };
+      return hit_info{{}, {}, rect{}, -1};
    }
 
    rect layer_element::bounds_of(context const& ctx, std::size_t index) const
@@ -86,30 +86,7 @@ namespace cycfi { namespace elements
       clamp_min(height, limits.min.y);
       clamp_max(height, limits.max.y);
 
-      return { left, top, left+width, top+height };
-   }
-
-   void layer_element::begin_focus()
-   {
-      focus_top();
-      return composite_base::begin_focus();
-   }
-
-   void layer_element::focus_top()
-   {
-      for (int ix = int(size())-1; ix >= 0; --ix)
-      {
-         auto& e = at(ix);
-         if (composite_base::focus() == &e)
-            break; // element at at(ix) is already the focus
-
-         if (e.wants_focus())
-         {
-            e.begin_focus();
-            composite_base::focus(ix);
-            break;
-         }
-      }
+      return {left, top, left+width, top+height};
    }
 
    ////////////////////////////////////////////////////////////////////////////
@@ -117,60 +94,153 @@ namespace cycfi { namespace elements
    ////////////////////////////////////////////////////////////////////////////
    void deck_element::draw(context const& ctx)
    {
+      if (_selected_index >= size())
+         return;
       rect bounds = bounds_of(ctx, _selected_index);
-      if (intersects(bounds, ctx.view_bounds()))
+      if (intersects(bounds, ctx.visible_bounds()))
       {
          auto& elem = at(_selected_index);
-         context ectx{ ctx, &elem, bounds };
+         context ectx{ctx, &elem, bounds};
          elem.draw(ectx);
       }
    }
 
-   void deck_element::refresh(context const& ctx, element& element, int outward)
+   void deck_element::refresh(context const& ctx, element& e, int outward)
    {
-      if (&element == this)
+      if (&e == this)
       {
          ctx.view.refresh(ctx, outward);
       }
-      else
+      else if (_selected_index < size())
       {
          rect bounds = bounds_of(ctx, _selected_index);
          auto& elem = at(_selected_index);
-         context ectx{ ctx, &elem, bounds };
-         elem.refresh(ectx, element, outward);
+         context ectx{ctx, &elem, bounds};
+         elem.refresh(ectx, e, outward);
+      }
+   }
+
+   void deck_element::in_context_do(context const& ctx, element& e, context_function f)
+   {
+      if (&e == this)
+      {
+         f(ctx);
+      }
+      else if (_selected_index < size())
+      {
+         rect bounds = bounds_of(ctx, _selected_index);
+         auto& elem = at(_selected_index);
+         context ectx{ctx, &elem, bounds};
+         elem.in_context_do(ectx, e, f);
       }
    }
 
    layer_element::hit_info deck_element::hit_element(context const& ctx, point p, bool control) const
    {
+      if (_selected_index >= size())
+         return hit_info{{}, {}, rect{}, -1};
       auto& e = at(_selected_index);
       if (!control || e.wants_control())
       {
          rect bounds = bounds_of(ctx, _selected_index);
          if (bounds.includes(p))
          {
-            context ectx{ ctx, &e, bounds };
-            if (e.hit_test(ectx, p))
-               return hit_info{ e.shared_from_this(), bounds, int(_selected_index) };
+            context ectx{ctx, &e, bounds};
+            if (auto leaf = e.hit_test(ectx, p, true, control))
+               return hit_info{&e, leaf, bounds, int(_selected_index)};
          }
       }
-      return hit_info{ {}, rect{}, -1 };
+      return hit_info{{}, {}, rect{}, -1};
    }
 
-   void deck_element::begin_focus()
+   bool deck_element::key(context const& ctx, key_info k)
    {
-      if (!composite_base::focus())
+      // Only the selected page takes keys, and Tab moves the focus into the
+      // selected page alone: the hidden pages are never focused.
+      if (_selected_index >= size())
+         return false;
+      auto& e = at(_selected_index);
+      rect bounds = bounds_of(ctx, _selected_index);
+      if (!intersects(bounds, ctx.view_bounds()))
+         return false;
+
+      context ectx{ctx, &e, bounds};
+      if (focus_index() == int(_selected_index))
+         return e.key(ectx, k);
+
+      if ((k.action == key_action::press || k.action == key_action::repeat)
+         && k.key == key_code::tab && e.wants_focus())
       {
-         auto& e = at(_selected_index);
-         if (e.wants_control() && e.wants_focus())
-            composite_base::focus(_selected_index);
+         bool backward = k.modifiers & mod_shift;
+         focus(_selected_index);
+         e.begin_focus(backward? from_bottom : from_top);
+         ctx.view.refresh(ctx);
+         return true;
       }
-      composite_base::begin_focus();
+      return false;
+   }
+
+   bool deck_element::text(context const& ctx, text_info info)
+   {
+      if (_selected_index >= size() || focus_index() != int(_selected_index))
+         return false;
+      auto& e = at(_selected_index);
+      context ectx{ctx, &e, bounds_of(ctx, _selected_index)};
+      return e.text(ectx, info);
+   }
+
+   bool deck_element::wants_focus() const
+   {
+      return _selected_index < size() && at(_selected_index).wants_focus();
+   }
+
+   void deck_element::begin_focus(focus_request req)
+   {
+      if (_selected_index >= size())
+         return;
+      auto& e = at(_selected_index);
+      if (e.wants_focus())
+      {
+         focus(_selected_index);
+         e.begin_focus(req);
+      }
+   }
+
+   bool deck_element::hotkey(context const& ctx, key_info k)
+   {
+      // Every page is asked, for when it is selected; the selected page
+      // alone takes the key.
+      if (is_hotkey_test(k))
+         return layer_element::hotkey(ctx, k);
+      if (!ctx.enabled || _selected_index >= size())
+         return false;
+      auto& e = at(_selected_index);
+      context ectx{ctx, &e, bounds_of(ctx, _selected_index)};
+      return e.hotkey(ectx, k);
    }
 
    void deck_element::select(std::size_t index)
    {
-      if (index < size())
-         _selected_index = index;
+      if (index >= size() || index == _selected_index)
+         return;
+
+      // The page losing the selection gives up the focus; if the deck had
+      // the focus, the newly selected page takes it.
+      bool had_focus = focus_index() != -1;
+      if (had_focus)
+         composite_base::end_focus();
+      _selected_index = index;
+      if (had_focus)
+         begin_focus(from_top);
    }
-}}
+
+   std::string layer_element::class_name() const
+   {
+      return "layer";
+   }
+
+   std::string deck_element::class_name() const
+   {
+      return "deck";
+   }
+}

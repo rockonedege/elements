@@ -1,5 +1,5 @@
 /*=============================================================================
-   Copyright (c) 2016-2020 Joel de Guzman
+   Copyright (c) 2016-2023 Joel de Guzman
 
    Distributed under the MIT License [ https://opensource.org/licenses/MIT ]
 =============================================================================*/
@@ -8,7 +8,7 @@
 #include <elements/view.hpp>
 #include <cmath>
 
-namespace cycfi { namespace elements
+namespace cycfi::elements
 {
    view_limits slider_base::limits(basic_context const& ctx) const
    {
@@ -35,12 +35,12 @@ namespace cycfi { namespace elements
    void slider_base::layout(context const& ctx)
    {
       {
-         context sctx { ctx, &track(), ctx.bounds };
+         context sctx {ctx, &track(), ctx.bounds};
          sctx.bounds = track_bounds(sctx);
          track().layout(sctx);
       }
       {
-         context sctx { ctx, &thumb(), ctx.bounds };
+         context sctx {ctx, &thumb(), ctx.bounds};
          sctx.bounds = thumb_bounds(sctx);
          thumb().layout(sctx);
       }
@@ -48,15 +48,15 @@ namespace cycfi { namespace elements
 
    void slider_base::draw(context const& ctx)
    {
-      if (intersects(ctx.bounds, ctx.view_bounds()))
+      if (intersects(ctx.bounds, ctx.visible_bounds()))
       {
          {
-            context sctx { ctx, &track(), ctx.bounds };
+            context sctx {ctx, &track(), ctx.bounds};
             sctx.bounds = track_bounds(sctx);
             track().draw(sctx);
          }
          {
-            context sctx { ctx, &thumb(), ctx.bounds };
+            context sctx {ctx, &thumb(), ctx.bounds};
             sctx.bounds = thumb_bounds(sctx);
             thumb().draw(sctx);
          }
@@ -66,7 +66,7 @@ namespace cycfi { namespace elements
    bool slider_base::scroll(context const& ctx, point dir, point p)
    {
       auto sdir = scroll_direction();
-      double new_value = value() + (_is_horiz ? dir.x * sdir.x : dir.y * -sdir.y) * 0.005;
+      double new_value = value() + (_is_horiz ? dir.x*sdir.x + !dir.x*dir.y*-sdir.y : dir.y * -sdir.y) * 0.005;
       clamp(new_value, 0.0, 1.0);
       track_scroll(ctx, dir, p);
       edit_value(new_value);
@@ -197,81 +197,13 @@ namespace cycfi { namespace elements
          on_change(val);
    }
 
-   void draw_slider_marks(
-      canvas& cnv, rect bounds, float size, std::size_t num_divs
-    , std::size_t major_divs, color c)
+   std::string slider_base::class_name() const
    {
-      auto w = bounds.width();
-      auto h = bounds.height();
-      bool vertical = w < h;
-      float pos = vertical? bounds.top : bounds.left;
-      float incr = (vertical? h : w) / num_divs;
-      auto state = cnv.new_state();
-      auto const& theme = get_theme();
-
-      cnv.stroke_style(theme.ticks_color);
-      for (std::size_t i = 0; i != num_divs+1; ++i)
-      {
-         float inset = 0;
-         if (i % (num_divs / major_divs))
-         {
-            // Minor ticks
-            inset = size / 6;
-            cnv.line_width(theme.minor_ticks_width);
-            cnv.stroke_style(c.level(theme.minor_ticks_level));
-         }
-         else
-         {
-            // Major ticks
-            cnv.line_width(theme.major_ticks_width);
-            cnv.stroke_style(c.level(theme.major_ticks_level));
-         }
-
-         if (vertical)
-         {
-            cnv.move_to({ bounds.left + inset, pos });
-            cnv.line_to({ bounds.right - inset, pos });
-         }
-         else
-         {
-            cnv.move_to({ pos, bounds.top + inset });
-            cnv.line_to({ pos, bounds.bottom - inset });
-         }
-         cnv.stroke();
-         pos += incr;
-      }
+      return "slider";
    }
 
-   void draw_slider_labels(
-      canvas& cnv
-    , rect bounds
-    , float size
-    , float /* font_size */
-    , std::string const labels[]
-    , std::size_t num_labels
-   )
+   std::string basic_selector_base::class_name() const
    {
-      bool reverse = size < 0;
-      bool vertical = bounds.width() < bounds.height();
-      auto w = bounds.width();
-      auto h = bounds.height();
-      float pos = vertical? bounds.top : bounds.left;
-      float incr = (vertical? h : w) / (num_labels - 1);
-      auto state = cnv.new_state();
-      auto const& theme = get_theme();
-
-      cnv.text_align(cnv.middle | cnv.center);
-      cnv.fill_style(theme.label_font_color);
-
-      for (std::size_t i = 0; i != num_labels; ++i)
-      {
-         point where = vertical?
-            point{ reverse? bounds.left : bounds.right, pos } :
-            point{ pos, reverse? bounds.top : bounds.bottom }
-            ;
-
-         cnv.fill_text(where, labels[vertical? (num_labels-i)-1 : i].c_str());
-         pos += incr;
-      }
+      return "selector";
    }
-}}
+}

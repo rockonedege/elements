@@ -7,6 +7,7 @@
 #include <infra/support.hpp>
 
 using namespace cycfi::elements;
+using namespace cycfi::artist;
 using namespace cycfi;
 
 auto constexpr bkd_color = rgba(35, 35, 37, 255);
@@ -15,8 +16,8 @@ auto background = rbox(bkd_color, 5);
 // Function to calculate distance
 float distance(point a, point b)
 {
-  double c = (b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y);
-  return sqrt(c);
+  float c = (b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y);
+  return sqrtf(c);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -81,7 +82,7 @@ void my_custom_control::draw(context const& ctx)
    ctx.canvas.line_width(1.0);
    ctx.canvas.stroke_style(color(0, 0, 0.5));
    auto outer_ring = circle(center_point(ctx.bounds), _radius);
-   ctx.canvas.circle(outer_ring);
+   ctx.canvas.add_circle(outer_ring);
    ctx.canvas.stroke();
 
    // Center points for four knobs.
@@ -99,7 +100,7 @@ void my_custom_control::draw(context const& ctx)
       ctx.canvas.line_width(1.0);
       ctx.canvas.stroke_style(color(0, 0, 0.6));
       ctx.canvas.fill_style(color(1.0, 1.0, 1.0));
-      ctx.canvas.circle(circle(knob, 5.0));
+      ctx.canvas.add_circle(circle(knob, 5.0));
       ctx.canvas.fill_preserve();
       ctx.canvas.stroke();
 
@@ -109,7 +110,7 @@ void my_custom_control::draw(context const& ctx)
       {
          ctx.canvas.line_width(2.0);
          ctx.canvas.stroke_style(color(0, 0, 0.8));
-         ctx.canvas.circle(circle(knob, 7.0));
+         ctx.canvas.add_circle(circle(knob, 7.0));
          ctx.canvas.stroke();
       }
    }
@@ -119,7 +120,7 @@ void my_custom_control::draw(context const& ctx)
    {
       ctx.canvas.line_width(2.0);
       ctx.canvas.stroke_style(color(0, 0.8, 0));
-      ctx.canvas.circle(circle(_knobs[_choosen_knob], 7.0));
+      ctx.canvas.add_circle(circle(_knobs[_choosen_knob], 7.0));
       ctx.canvas.stroke();
    }
 
@@ -127,7 +128,7 @@ void my_custom_control::draw(context const& ctx)
    {
       ctx.canvas.line_width(1.0);
       ctx.canvas.stroke_style(color(0, 0.5, 0.5, 0.2));
-      ctx.canvas.circle(circle(cursor_pos.x, cursor_pos.y, 10.0));
+      ctx.canvas.add_circle(circle(cursor_pos.x, cursor_pos.y, 10.0));
       ctx.canvas.stroke();
    }
 }
@@ -163,7 +164,7 @@ void my_custom_control::keep_tracking(context const& ctx, tracker_info& track_in
    clamp(_radius, 50, 150);
    if (on_change)
       on_change(_radius);
-   ctx.view.refresh(ctx.bounds);
+   ctx.view.refresh(ctx);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -176,7 +177,7 @@ bool my_custom_control::cursor(context const& ctx, point p, cursor_tracking stat
       case cursor_tracking::hovering:
       case cursor_tracking::entering:
          _mouse_over = true;
-         ctx.view.refresh(ctx.bounds);
+         ctx.view.refresh(ctx);
          break;
       case cursor_tracking::leaving:
          _mouse_over = false;
@@ -196,7 +197,7 @@ public:
 private:
 
    constexpr static float default_value = my_custom_control::default_value;
-   using dial_ptr = std::shared_ptr<dial_base>;
+   using dial_ptr = std::shared_ptr<basic_dial>;
    using label_ptr = decltype(share(label("")));
 
    auto              make_control();
@@ -215,13 +216,14 @@ private:
 
 auto my_app::make_control()
 {
+   using cycfi::elements::image;
    return
       layer(
          align_center_middle(
-            fixed_size({ 400, 400 },
+            fixed_size({400, 400},
                link(_my_control)             // Link our control
             )),
-         image{ "wall.jpg" }
+         image{"wall.jpg"}
       );
 }
 
@@ -238,7 +240,7 @@ auto my_app::make_button()
       };
 
    return
-      margin({ 50, 10, 50, 10 },
+      margin({50, 10, 50, 10},
          hold(btn)                           // Hold our shared button
       );
 }
@@ -292,7 +294,7 @@ void my_app::set_value(float val)
 auto my_app::make_control_panel()
 {
    return margin(
-      { 50, 20, 50, 20 },
+      {50, 20, 50, 20},
       layer(
          vgrid(
             span(5, make_dial()),
@@ -306,10 +308,14 @@ auto my_app::make_control_panel()
 }
 
 my_app::my_app(int argc, char* argv[])
- : app{ argc, argv, "Custom Control", "com.cycfi.custom-control" }
- , _win{ name() }
- , _view{ _win }
+ : app{"Custom Control"}
+ , _win{name()}
+ , _view{_win}
 {
+
+   // Set up the fonts and search paths once, at startup, so the
+   // first window does not pay for it.
+   init_resources();
    _win.on_close = [this]() { stop(); };
 
    _view.content(

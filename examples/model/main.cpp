@@ -1,0 +1,409 @@
+/*=============================================================================
+   Copyright (c) 2016-2023 Joel de Guzman
+
+   Distributed under the MIT License (https://opensource.org/licenses/MIT)
+=============================================================================*/
+#include <elements.hpp>
+#include <sstream>
+#include <iomanip>
+
+/*=============================================================================
+   Elements does not dictate a particular method for organizing a GUI
+   application. You have the flexibility to structure your application
+   according to your preferences. Here's a breakdown of the essential steps:
+
+   1. Build an elements hierarchy and install that as your content into the
+      view.
+
+   2. Establish a connection between the GUI elements and the application
+      through callbacks such as the button's `on_click` and the input text
+      box's `on_enter` hooks. These callbacks are invoked when the user
+      clicks the button or presses the enter key in the text box, for
+      example.
+
+   3. Ensure the GUI is updated to accurately represent the application state
+      whenever changes occur. The application may need the ability to inspect
+      the state of the GUI elements or set them to a specific state at any
+      given time.
+
+   A typical approach for steps 2 and 3 involves holding different GUI
+   elements as private members within an application or GUI class. These
+   elements are managed as shared pointers, created using the `share(e)`
+   function and held in the element hierarchy using the `hold(p)` function.
+   The GUI class oversees the interconnections and presents a higher-level
+   view to the application through a well-defined API.
+
+   This example presents a more elegant way to structure an elements
+   application using Models. The Model (elements/model.hpp) serves as an
+   abstraction for a data type that is linked to one or more user interface
+   elements. The actual data is accessed and modified through the `get` and
+   `set` member functions of the derived class. A user interface element can
+   be linked to a `model` by supplying an `update_function` via the
+   `on_update(f)` member function. A model calls every function it was
+   given, in the order they arrived, so any number of elements may show the
+   same value. Here the dial and the text box both show `_value`.
+
+   An element is linked through the view's bindings rather than by
+   calling `on_update` directly, because an observer outlives the element
+   that wanted it. The view holds each linked element weakly and remembers
+   the connection its observer was given, and takes them all off the model
+   when the view goes. An application that builds its user interface once
+   never notices; anything that rebuilds one, a plugin editor being opened
+   a second time for instance, would otherwise pile up dead observers.
+
+   The Model does not care about the GUI element types it is interacting
+   with. It is an abstract data type that models its underlying data type
+   (e.g. float, int, enum, etc.). It looks and acts like a concrete type.
+
+   For example, a `value_model<float>` acts just like a float. You can assign
+   a value to it:
+
+      m = 1.0;
+
+   or extract its value:
+
+      float i = m;
+
+   You can also update the GUI elements that are linked to it:
+
+      m.update(0.5);
+
+   These capabilities implement 2 and 3 of the requirements.
+
+   The `value_model<float>` is a derived class of the template class `model`.
+   It specifically addresses the typical scenario where the data is
+   internally stored by value within the class. The class includes `get` and
+   `set` member functions following the `Model` concept required by the model
+   template, facilitating the retrieval and modification of data.
+
+      Note: While this example utilizes the `value_model<float>`, you have
+      the flexibility to create your custom subclass of the template class
+      model to implement more tailored methods of accessing your data.
+
+   Adopting the model paradigm, the application and the user interface engage
+   with the model independently, unaware of each other's existence. The model
+   serves as a central hub, facilitating and coordinating interactions
+   between them:
+
+      application <----> model <----> GUI
+
+   The model decouples the application from the GUI.
+
+   1. The application is aware of the model, manages and interacts with it.
+   2. The GUI is also aware of the model and links to it via callbacks.
+   3. The model is unaware of the GUI.
+   4. The model may be aware of the application, e.g. if it needs to get data
+      from the application, but not necessarily, e.g. if it holds the data
+      itself.
+   5. The GUI and the application are both unaware of each other.
+
+   Number 5 is an important design principle known as "decoupling,"
+   emphasizing the separation of concerns and promoting independence between
+   the GUI and the application components. The advantages of decoupling in a
+   software design context include, modularity, scalability, and reusability,
+   and ease of maintainance.
+
+   In this example, we present a very simple model, comprising of a floating
+   point value and a preset. As the GUI elements are being built, they attach
+   themselves to the model through the view's bindings at different nodes
+   within the elements hierarchy. This illustrates the approach of designing
+   the user interface based on models.
+=============================================================================*/
+namespace elements = cycfi::elements;
+namespace icons = elements::icons;
+
+using elements::rgba;
+using elements::box;
+using elements::value_model;
+using elements::dial;
+using elements::radial_marks;
+using elements::radial_labels;
+using elements::basic_knob;
+using elements::selection_menu;
+using elements::input_box;
+using elements::label;
+using elements::view;
+using elements::app;
+using elements::window;
+
+// Main window background color
+auto constexpr bkd_color = rgba(35, 35, 37, 255);
+auto background = elements::box(bkd_color);
+
+// This is our simple model, comprising of a preset (an enum)
+// and a value normalized to 0.0 to 1.0.
+struct my_model
+{
+   enum preset
+   {
+      preset_none,
+      preset_100_percent,
+      preset_75_percent,
+      preset_50_percent,
+      preset_25_percent,
+      preset_0_percent,
+   };
+
+   value_model<float>   _value = 1.0;
+   value_model<preset>  _preset = preset_100_percent;
+};
+
+// Create a dial and establish its connection with the model.
+auto make_dial(my_model& model, view& view_)
+{
+   // Make a dial
+   auto dial_ptr = share(dial(radial_marks<20>(basic_knob<80>())));
+
+   // The dial follows the value, and gets the value the model holds right
+   // now. What the user does to the dial comes here instead of straight
+   // to the model, because there is more to do than assign: the value is
+   // no longer one of the presets, so the preset is taken off as well.
+   view_.bindings().follow(model._value, dial_ptr,
+      [&model](double val)
+      {
+         if (model._value != val)
+         {
+            model._value = val;
+            model._preset = my_model::preset_none;
+         }
+      }
+   );
+
+   auto control = radial_labels<15>(
+      hold(dial_ptr),
+      0.7,                                // Label font size (relative size)
+      "0", "1", "2", "3", "4",            // Labels
+      "5", "6", "7", "8", "9", "10"
+   );
+
+   return align_center_middle(control);
+}
+
+// Create a preset menu and establish its connection with the model.
+auto make_preset_menu(my_model& model, view& view_)
+{
+   // These are the menu labels
+   static char const* preset_labels[] = {
+         "100 Percent",
+         "75 Percent",
+         "50 Percent",
+         "25 Percent",
+         "0 Percent",
+      };
+
+   // We use a map to associate the menu labels with the preset enumeration.
+   static auto preset_map =
+      std::unordered_map<std::string_view, my_model::preset> {
+         { preset_labels[0], my_model::preset_100_percent  },
+         { preset_labels[1], my_model::preset_75_percent },
+         { preset_labels[2], my_model::preset_50_percent },
+         { preset_labels[3], my_model::preset_25_percent  },
+         { preset_labels[4], my_model::preset_0_percent  }
+      };
+
+   // We make a selection menu.
+   auto preset_menu =
+      selection_menu(
+         [&model](std::string_view select_str)
+         {
+            // This is called when the user selects an item in the menu.
+
+            // Convert the selected menu item to the preset enumeration.
+            auto select = preset_map[select_str];
+
+            // Set the model's preset
+            model._preset = select;
+
+            // Set the value of the model accordingly.
+            switch (select)
+            {
+               case my_model::preset_100_percent:
+                  model._value = 1.0;
+                  break;
+               case my_model::preset_75_percent:
+                  model._value = 0.75;
+                  break;
+               case my_model::preset_50_percent:
+                  model._value = 0.5;
+                  break;
+               case my_model::preset_25_percent:
+                  model._value = 0.25;
+                  break;
+               case my_model::preset_0_percent:
+                  model._value = 0.0;
+                  break;
+               default:
+                  break;
+            };
+         },
+         preset_labels
+      );
+
+   // The menu shows the preset as text, which no value setter can say,
+   // so it is attached with a function that puts the preset into the
+   // label. The view is refreshed for us afterwards.
+   view_.bindings().attach(model._preset, preset_menu.second,
+      [](auto& label, my_model::preset val)
+      {
+         if (val == my_model::preset_none)
+         {
+            // Prepend '*' to the string to indicate that it is being edited.
+            auto text = label.get_text();
+            if (text[0] != '*')
+               label.set_text("*" + std::string{text});
+         }
+         else
+         {
+            label.set_text(preset_labels[int(val)-1]);
+         }
+      }
+   );
+
+   return
+      align_top(
+         align_center(
+            hsize(180,
+               htile_spaced(10.0,
+                  label("Preset:"),
+                  preset_menu.first
+               )
+            )
+         )
+      );
+}
+
+// Create an input text box and establish its connection with the model.
+auto make_input_box(my_model& model, view& view_)
+{
+   auto tbox = input_box("value");
+
+   // The text box shows the value as text, so it too is attached with a
+   // function of its own. Note that the dial is showing the same value:
+   // a model updates every control it was given, in the order they came.
+   view_.bindings().attach(model._value, tbox.second,
+      [](auto& input, double val)
+      {
+         std::ostringstream stream;
+         stream << std::fixed << std::setprecision(2) << val;
+         input.set_text(stream.str());
+         input.select_all();
+      }
+   );
+
+   // When the user presses the enter key, we'll convert the text to a number
+   // and then update the model with the new value. We will deal with input
+   // validation and bring up a message box when errors are encountered.
+   tbox.second->on_enter =
+      [&model, &view_](std::string_view text)->bool
+      {
+         std::string::size_type pos;
+         std::string error{""};
+         double val;
+
+         try
+         {
+            val = std::stod(std::string{text}, &pos);
+         }
+         catch(std::invalid_argument const& e)
+         {
+            error = "Illegal characters in input.";
+         }
+
+         if (pos != text.size())
+         {
+            error = "Illegal characters in input.";
+         }
+         else if (val < 0.0 || val > 1.0)
+         {
+            error =
+               "Number is out of range. "
+               "Expected range is from 0.0 to 1.0."
+               ;
+         }
+         else
+         {
+            model._value = val;
+            model._preset = my_model::preset_none;
+         }
+
+         if (error != "")
+         {
+            auto on_ok =
+               [&model]()
+               {
+                  // When errors are encountered, reset the model's value to
+                  // its previous state.
+                  model._value.update();
+               };
+
+            // Bring up a message box.
+            auto popup = message_box1(view_, error, icons::attention, on_ok);
+            open_popup(popup, view_);
+            return false;
+         }
+         return true;
+      };
+
+   tbox.second->on_escape =
+      [&model]()->bool
+      {
+         // When the user presses the escape key, reset the model's value to
+         // its previous state.
+         model._value.update();
+         return true;
+      };
+
+   return
+      align_bottom(
+         align_center(
+            hsize(40, tbox.first)
+         )
+      );
+}
+
+// Finally, we have our main content.
+auto make_content(my_model& model, view& view_)
+{
+   static float const grid_coords[] = {0.1, 0.9, 1.0};
+
+   return
+      margin({20, 20, 20, 20},
+         group(
+            margin({20, 20, 20, 20},
+               vgrid(grid_coords,
+                  make_preset_menu(model, view_),
+                  make_dial(model, view_),
+                  make_input_box(model, view_)
+               )
+            )
+         )
+      );
+}
+
+int main(int argc, char* argv[])
+{
+   app _app("Model");
+
+   // Set up the fonts and search paths once, at startup, so the
+   // first window does not pay for it.
+   cycfi::elements::init_resources();
+   window _win(_app.name());
+   _win.on_close = [&_app]() { _app.stop(); };
+
+   // Our simple model, declared before the view so that it is destroyed
+   // after it. The view's bindings leave the model on their way out, and
+   // the model has to still be there for that.
+   my_model model;
+
+   view view_(_win);
+
+   view_.content(
+      make_content(model, view_),
+      background
+   );
+
+   model._value = 1.0;
+
+   _app.run();
+   return 0;
+}

@@ -1,0 +1,219 @@
+/*=============================================================================
+   Copyright (c) 2016-2023 Joel de Guzman
+
+   Distributed under the MIT License (https://opensource.org/licenses/MIT)
+=============================================================================*/
+#include <elements/window.hpp>
+#include <elements/support.hpp>
+#include <functional>
+#include <memory>
+#include <vector>
+#include <gtk/gtk.h>
+
+namespace elements = cycfi::elements;
+
+namespace cycfi::elements
+{
+   struct host_window
+   {
+      GtkWidget* host = nullptr;
+      window* owner = nullptr;
+      std::vector<std::function<void()>> on_activate;
+
+      // Work deferred until the app activates holds a weak reference to
+      // this, and skips itself if the window is gone by then.
+      std::shared_ptr<bool> alive = std::make_shared<bool>(true);
+   };
+
+   extern std::vector<std::function<void()>> on_activate;
+   GtkApplication* get_app();
+   bool app_is_activated();
+
+   GtkWidget* get_window(host_window& h)
+   {
+      return h.host;
+   }
+
+   void on_window_activate(host_window& h, std::function<void()> f)
+   {
+      h.on_activate.push_back(f);
+   }
+
+   namespace
+   {
+      gboolean on_window_delete(GtkWidget*, GdkEvent*, gpointer user_data)
+      {
+         auto* w = static_cast<host_window*>(user_data)->owner;
+         if (w && w->on_close)
+            w->on_close();
+         return false;  // and let GTK close the window
+      }
+   }
+
+   float get_scale(GtkWidget* widget)
+   {
+      auto gdk_win = gtk_widget_get_window(widget);
+      return gdk_window_get_scale_factor(gdk_win);
+   }
+
+   window::window(std::string const& name, int style_, rect const& bounds)
+    :  _window(new host_window)
+   {
+      _window->owner = this;
+      // Chicken and egg. GTK wants us to create windows only
+      // after the app is activated. So we have a scheme to
+      // defer actions. If the app is not activated make_window is
+      // added to the on_activate vector, otherwise, it is called
+      // immediately.
+
+      auto make_window =
+         [this, name, style_, bounds, alive = std::weak_ptr<bool>{_window->alive}]()
+         {
+            if (alive.expired())
+               return;
+            GtkWidget* win = gtk_application_window_new(get_app());
+            g_object_ref(win);
+            gtk_window_set_title(GTK_WINDOW(win), name.c_str());
+
+            // No title, no decorations: a bare window is the size asked for,
+            // with no frame or title bar, and none of their minimum size.
+            if (!(style_ & with_title))
+               gtk_window_set_decorated(GTK_WINDOW(win), false);
+            _window->host = win;
+            g_signal_connect(win, "delete-event",
+               G_CALLBACK(on_window_delete), _window);
+
+            for (auto f : _window->on_activate)
+               f();
+
+            gtk_widget_show_all(win);
+
+            position(bounds.top_left());
+            size({bounds.width(), bounds.height()});
+         };
+
+      if (app_is_activated())
+         make_window();
+      else
+         on_activate.push_back(make_window);
+   }
+
+   window::~window()
+   {
+      if (_window->host)
+      {
+         g_signal_handlers_disconnect_by_data(_window->host, _window);
+         g_object_unref(_window->host);
+      }
+      delete _window;
+   }
+
+   point window::size() const
+   {
+      auto win = GTK_WINDOW(_window->host);
+      gint width, height;
+      gtk_window_get_size(win, &width, &height);
+      return {float(width), float(height)};
+   }
+
+   void window::size(point const& p)
+   {
+      auto win = GTK_WINDOW(_window->host);
+      gtk_window_resize(win, p.x, p.y);
+   }
+
+   void window::limits(view_limits limits_)
+   {
+      auto set_limits =
+         [this, limits_, alive = std::weak_ptr<bool>{_window->alive}]()
+         {
+            if (alive.expired())
+               return;
+            constexpr float max = 10E6;
+            auto win = GTK_WINDOW(_window->host);
+
+            // No window can be larger than the screen: content wider or
+            // taller than any (an input box asks for the full extent) gets
+            // the screen's work area.
+            float screen_w = max, screen_h = max;
+            auto display = gtk_widget_get_display(_window->host);
+            auto monitor = display? gdk_display_get_primary_monitor(display) : nullptr;
+            if (!monitor && display)
+               monitor = gdk_display_get_monitor(display, 0);
+            if (monitor)
+            {
+               GdkRectangle area;
+               gdk_monitor_get_workarea(monitor, &area);
+               screen_w = area.width;
+               screen_h = area.height;
+            }
+
+            GdkGeometry hints;
+            hints.min_width = std::min<float>(limits_.min.x, screen_w);
+            hints.max_width = std::min<float>(limits_.max.x, max);
+            hints.min_height = std::min<float>(limits_.min.y, screen_h);
+            hints.max_height = std::min<float>(limits_.max.y, max);
+
+            // A child not yet allocated (1x1, as one just added to a shown
+            // window is) gives no measure of the decoration.
+            auto child = gtk_bin_get_child(GTK_BIN(win));
+            if (child && gtk_widget_get_allocated_width(child) > 1)
+            {
+               // Find the difference between the child size and window size to
+               // determine the window decoration size, which is then used to
+               // offset the hints.
+               GtkAllocation window_alloc, child_alloc;
+               gtk_widget_get_allocation(_window->host, &window_alloc);
+               gtk_widget_get_allocation(child, &child_alloc);
+
+               int decoration_width = window_alloc.width - child_alloc.width;
+               int decoration_height = window_alloc.height - child_alloc.height;
+
+               hints.min_width += decoration_width;
+               hints.max_width += decoration_width;
+
+               hints.min_height += decoration_height;
+               hints.max_height += decoration_height;
+            }
+
+            gtk_window_set_geometry_hints(
+               win,
+               _window->host,
+               &hints,
+               GdkWindowHints(GDK_HINT_MIN_SIZE | GDK_HINT_MAX_SIZE)
+            );
+         };
+
+      if (app_is_activated())
+         set_limits();
+      else
+         on_activate.push_back(set_limits);
+   }
+
+   point window::position() const
+   {
+      gint x, y;
+      gtk_window_get_position(GTK_WINDOW(_window->host), &x, &y);
+      auto scale = get_scale(_window->host);
+      return {float(x) * scale, float(y) * scale};
+   }
+
+   void window::position(point const& p)
+   {
+      auto set_position =
+         [this, p, alive = std::weak_ptr<bool>{_window->alive}]()
+         {
+            if (alive.expired())
+               return;
+            auto win = GTK_WINDOW(_window->host);
+            auto scale = get_scale(_window->host);
+            gtk_window_move(win, p.x / scale, p.y / scale);
+         };
+
+      if (app_is_activated())
+         set_position();
+      else
+         on_activate.push_back(set_position);
+   }
+}
+

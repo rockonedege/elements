@@ -1,0 +1,286 @@
+# Elements development log
+
+Newest first. Each entry records what landed on a branch, with the detail that
+would otherwise have lived in commit bodies (commit messages are kept to a
+single subject line). Hashes are the post-rewrite short hashes on the branch
+named in the heading.
+
+## 2026-10-17 -- medium bug fixes (develop)
+
+**TL;DR:** An input box fits a narrow limit (#280), and a tooltip's tip no
+longer takes the focus or opens misplaced the first time (#426).
+
+- `649f56de` A scroller kept a 32 px minimum on each scrolling axis, room
+  for a scrollbar, even with no scrollbars. An input box is such a
+  scroller, so with its padding it could not be narrower than 42, and a
+  narrower limit let it draw past its space. With no scrollbars a
+  scrolling axis now has no minimum. `input_box` is the only user of
+  `no_scrollbars`.
+- `43528a22` A tooltip opened its tip as a popup, which takes the focus
+  when its content can (a text box), so typing in the element under the
+  cursor went to the tip. The tip now opens without the focus. And a tip
+  was placed from its limits before it had been laid out, when wrapped
+  text is one line tall; the first time, a tip above its element reached
+  down over it. The tip is now laid out once before it is placed.
+
+Both are covered by new tests that fail without the fixes. The full suite
+passes on macOS (Quartz 2D); the changes touch no host code.
+
+## 2026-10-17 -- easy bug fixes (develop)
+
+**TL;DR:** Three small fixes from the issue triage (#389, #391, #440) and an
+unused variable.
+
+- `2b1b9f34` The Windows host read the touchpad scroll direction from the
+  registry once, so a change made while the app ran was missed (#391). It
+  is read again at most every 10 seconds, as on Linux.
+- `fdac8610` The GTK host found its executable through
+  `readlink("/proc/self/exe")`, which MinGW lacks (#440). On Windows it
+  now uses `GetModuleFileNameW`, and the two lookups share one helper. The
+  Linux build passes its tests on the GTK host; MinGW itself was not built.
+- `4ac13b60` Removed an unused `thm` from `basic_tri_thumb_styler::draw`.
+- `2453eb10` Artist `cb048b3`: Skia filters a large image downscale through
+  mipmaps instead of aliasing (#389). See Artist's dev log.
+
+The Windows Direct2D run fails three menu focus tests
+(`submenu_test.cpp:590, 621, 635`); unmodified develop fails the same three.
+
+## 2026-10-17 -- Windows DPI change between monitors (develop)
+
+**TL;DR:** A window moved to a monitor of a different scale now redraws at
+the new DPI and keeps its logical size (issue #190).
+
+- `d5d615a6` Two causes. Under per-monitor (v1) awareness only top-level
+  windows get `WM_DPICHANGED`, so the view (a child window) never heard of
+  the change and Direct2D kept drawing at the old DPI into the top-left of
+  the window. The Direct2D paint path now follows the window's DPI, as it
+  already followed the client size, which also covers plugin hosts that
+  choose their own awareness. The top-level window ignored the suggested
+  rect; it now scales its client by the DPI ratio and adds its frame back,
+  since the v1 frame does not scale and the suggested rect would hand the
+  surplus to the client. Verified on a 125% laptop panel and a 175%
+  external monitor with the Direct2D build: 885x480 logical on both, exact
+  size on return, sliders responsive. Skia and Cairo were not run.
+
+## 2026-10-01 -- curve shapes, image fill, button faces (develop)
+
+**TL;DR:** The last drawing in the QPlug Dexter editor moved into
+Elements: curve lines that bend and carry guides, an image that fills its
+space, button faces made of any elements, and a frame of a given color.
+Dexter now draws nothing itself.
+
+- `d209ada9` `frame(color, width, radius)`: a plain rounded outline of the
+  given color, line width and corner radius. The default `frame` is the
+  theme's, as before.
+- `af8bb8a1` `button_body`: a button's body alone, drawn by the button's
+  state, with no size of its own, to layer content of any kind on (a
+  picture on a button). `button_face(off, on)`: one element drawn while
+  the button is off, the other while it is on (a flat box with a grey
+  edge and one with a blue edge, each with its label). The text styler
+  could not serve: its maximum height is its text's, and every size
+  wrapper clamps to the subject's limits. Tests in
+  `test/button_body_test.cpp`.
+- `ac8c5012` `curve_lines`: `shape(segment, t)` bends a segment (the DX7's
+  exponential keyboard scaling), sampled `steps` times; guides across at
+  `horizontal_guides` heights (the floor, at 0, by default, so existing
+  users draw as before) and down through `vertical_guides` points, in the
+  floor's color; a transparent fill draws none; `min_size` replaces the
+  fixed 120 by 60. `basic_curve_editor::fit_width` spreads the points
+  across the plot, for a preview of a curve whose span varies.
+- `6c1270d7` `image::fill`: the whole image scaled into the space given, each
+  direction on its own (CSS `object-fit: fill`; `fit` is `contain`).
+  Named `fill` because `stretch` would hide every element's layout
+  `stretch()`.
+- `386f5be1` `image_grid_cell` has no minimum size, as a fitted image has
+  none; it was 32 by 32, which held a wave picture on a button too tall.
+
+Suite 47 of 47.
+
+## 2026-10-01 -- image_grid_menu (develop)
+
+**TL;DR:** One image divided into equal cells is a choice: a menu of all
+its cells, or one cell shown alone, with stylers drawn over each cell.
+It replaced the 430 lines of drawing behind the QPlug Dexter example's
+algorithm menu and chart.
+
+- `bb10cb87` `basic_image_grid`, a `proxy_base` over any image and a number of
+  columns and rows; cells are numbered left to right, then top to
+  bottom. Its current cell is a value of its own, `value(i)` and
+  `on_change`, so a model binder binds it like any control. The proxy's
+  subject is a cell styler, drawn over each cell shown; it finds the grid
+  with `find_parent` and asks `drawing()` and `state(i)` (normal, hot,
+  current), as `curve_editor`'s handle styler does.
+  `basic_image_grid_menu` (`image_grid_menu`) lays every cell out at a
+  given scale; the cell under the cursor is hot, and a press and a
+  release on the same cell pick it and close an enclosing popup.
+  `basic_image_grid_cell` (`image_grid_cell`) shows the current cell
+  alone, fitted, its proportions kept. Stylers: `image_grid_highlight`,
+  the default, tints the hot cell, frames the current one and, given a
+  `label` function, labels each cell; `image_regions` takes rects per
+  cell in the cell's unit square and a state function, and frames a lit
+  region or shades a dimmed one, for a picture with parts (Dexter's
+  chart: the operator being edited, the switched-off ones). Eight cases
+  in `test/image_grid_test.cpp` on an offscreen image; suite 41 of 41.
+  Joel's design; images are PNG for now, SVG when Elements can load it.
+
+## 2026-10-01 -- curve_editor (develop)
+
+**TL;DR:** A general control of draggable points, `curve_editor`,
+replaces the custom envelope trackers in QPlug's Anna and Dexter examples
+and serves any curve made of points: EQ bands, transfer curves, LFO
+shapes, automation lanes, an XY pad.
+
+- `d6ab1277` `basic_curve_editor`, a `tracker<proxy_base>` over N
+  `curve_point`s in a unit square with y up; a point may hold its x as a
+  distance from the point before it (`relative_x`), so envelope segments
+  are durations. Where a point may go is one client function,
+  `constrain(pts, i, to) -> point`, with `in_unit_square`,
+  `between_neighbors` and `default_constraint` to compose; `movable(i)`
+  says which points can be taken hold of. Each axis of each point is a
+  control of its own for a model binder, `x_of(editor, i)` and
+  `y_of(editor, i)` (a `curve_value`: `value`, `on_change`, `on_gesture`,
+  `refresh_target`); a point that follows another is bound to the same
+  model. A gesture on an axis begins the first time a drag changes it,
+  and the callbacks report where the drag put the point, since a model
+  binding may set it again meanwhile. `on_change(i, pos)` for code that
+  binds nothing; `on_insert` and `on_erase` let a double click add or
+  remove a point. The proxy's subject draws the curve (`curve_lines`) and
+  a handle styler each point (`curve_handle`); both find the editor with
+  `find_parent`. Points that coincide go to the one last dragged. Twelve
+  cases in `test/curve_editor_test.cpp`, driven through the headless
+  view; suite 29 of 29. Replaced a first design with a per-point motion
+  enum and ranges, on Joel's suggestion: one function says it all.
+
+## 2026-10-01 -- refresh batching and the on-button opacity (develop)
+
+**TL;DR:** Element refreshes requested together are drawn as one, which
+made loading a preset in a 150-parameter plugin editor fast, and an "on"
+button is drawn at 0.7 opacity instead of 0.5.
+
+- `463b3c27` `view::refresh(element)` gathers the elements asked for until
+  the next poll, dropping duplicates. Up to 4 are refreshed where they
+  are; more than that, the whole view is refreshed once. Each element
+  refresh searches the tree for the element, computing layout on the way,
+  about 5 ms per search in a Debug build of the QPlug Dexter editor, so a
+  preset load (about 450 refreshes) beachballed for seconds. The threshold
+  of 4 keeps a drag redrawing only its control and its readout. Refresh
+  may be called off the main thread, so the gathering is locked.
+- `d199511b` the default button styler draws an "on" button's body at 0.7
+  opacity, up from 0.5, at which a latched or toggled button was hard to
+  tell from one that is off (Joel's choice, compared side by side in the
+  buttons example). Elements test suite: 1 of 1.
+
+## 2026-06-09 to 06-14 -- master hotfixes
+
+**TL;DR:** Three master-only CI/build fixes on top of the 2025-09 line.
+
+- `b52d542a` ci: fix Windows MSVC build -- use vswhere to locate Visual Studio
+  instead of a hardcoded path; widen .gitignore to cover `build-*/`,
+  `vcpkg_installed/`, `lib/artist/`, `ai/`.
+- `c7f37447` ci: skip build for docs-only changes.
+- `8a4d0913` ci: remove the Coverity scan workflow (#448) -- the scheduled scan
+  had been failing and is not worth maintaining.
+
+## 2026-06-06 -- artist submodule bumps: text-editor perf and backend-free headers
+
+**TL;DR:** Track artist's text-engine perf work and its backend-free header
+refactor through `lib/artist`.
+
+- `de77f06e` bump lib/artist to the text-editor perf work (#370): skip full reflow
+  when width is unchanged (per-keystroke editing O(1) in document size instead of
+  O(paragraphs)); viewport-cull draw to visible paragraphs (drawing O(visible));
+  `para_at_y` via `std::upper_bound`. Large-document editing/scrolling is now
+  responsive.
+- `6b6226ce` bump to artist `b8aff39` (draw member-template; backend-free engine
+  header), then `85cf0f5a` bump to `408a358` (the final clean `draw(canvas&)` and
+  backend-free-includable canvas/image/path headers, superseding the
+  member-template step).
+
+## 2026-06-05 -- text editor on the rope engine, artist fixes, logging/tracing
+
+**TL;DR:** The text widgets are re-backed onto artist's multi-paragraph
+`text_layout` engine so a keystroke reshapes only the touched paragraph, a
+runtime-tunable logging facility plus an element-traversal tracer are added, and
+several artist text fixes and Windows build warnings are picked up.
+
+- `1f7135d0` Text editor on the rope-backed multi-paragraph engine (#370, squash
+  of feature/text-editor-engine): re-back
+  static_text_box/basic_text_box/basic_input_box onto `artist::text_layout` with
+  the public API unchanged. insert/replace/erase route to the engine's incremental
+  methods; `get_text()`/`value()` return a view into a lazily-materialized cache (a
+  copy, not a reshape); undo still snapshots the u32string. Bumps lib/artist to the
+  engine (artist develop `ef70b80`: rope + paragraph_index + text_layout; former
+  text_layout renamed text_run). Also carries the macOS Skia host live-resize gap
+  fix (disable implicit CALayer animation on the Metal sublayer).
+- `14a3d2b6` logging and element-traversal tracing:
+  - Logging (Part 1, always compiled, runtime-gated via `CYCFI_LOG=cat=level`):
+    quill v9.0.3 (no external deps), bounded/drop async queue so it never blocks
+    the UI/audio thread. Categories app/window/view/render/input/resource/layout/
+    error/trace, each its own level. `base_view` exposes cross-platform on_open/
+    on_size_change/on_scale_change/on_close that every host (macOS/Windows/GTK)
+    calls and `view` overrides to log, so host code carries no LOG. `error_handler`
+    is a global singleton with hookable non-null handlers (default LOG_ERROR) and
+    an error_id enum (no_gpu_device, graphics_context_failed, render_surface_failed,
+    font_load_failed, image_load_failed), wired at the render-context/font/image
+    sites and working mid-construction and in plugins. Configurable log location
+    via `log_init(app_name)` with per-OS dirs and a `CYCFI_LOG_DIR` override.
+  - Tracing (Part 2, always compiled, runtime-gated `CYCFI_LOG=trace=debug`, off by
+    default): `trace_scope` reads the context tree and emits JSON-lines
+    (enter/exit/leaf) to `<app>-trace.jsonl` with call args, return values, child
+    index, and the actual leaf control that handled the gesture; decorator proxies
+    are skipped. `tools/trace_graph.py` reconstructs the per-gesture call tree as a
+    YAML report or a Mermaid flowchart. Also adds `class_name()` overrides across
+    element classes (trace labels and general debugging).
+- `862362c4` bump artist (`4552432`): text no longer disappears when a string ends
+  in a ligature; no .notdef box for a trailing newline after a ligature; a trailing
+  hard break opens an empty line so the caret advances on a single Return
+  (Skia/Quartz, matching Cairo) (#384).
+- `b3a70585` bump artist: fix CJK characters dropped on line wrap (characters were
+  lost at every soft wrap; Skia read past the glyph array on the force-break path).
+  Verified on the text_edit example across Skia/Cairo/Quartz2D (#430).
+- `82a69cf8` fix Windows build warnings (#439): drop a self-assignment in
+  busy_bar_base (-Wsequence-point); parenthesize win32 scroll-direction comparisons
+  and default-init `view_info::_scroll_dir` (-Wparentheses,
+  -Wmissing-field-initializers); make win32 DropTarget's destructor virtual
+  (-Wdelete-non-virtual-dtor).
+
+## 2026-06-04 -- text selection and GTK partial-refresh fixes
+
+**TL;DR:** Double-click word selection uses artist's UAX-29 word boundaries, and a
+GTK partial-refresh offset bug that left edges unpainted is fixed.
+
+- `0e373b2e` text_box: select whole words on double-click and fix the next-word
+  caret. Artist `word_break` now exposes UAX-29 boundaries (a break after a word's
+  last character); consume them so the first word on a line selects fully and
+  Ctrl+Right lands after the word, not on its last character. Bumps the artist
+  submodule for the word_break change and the earlier GTK+Cairo device_to_user fix.
+- `da614b5f` gtk host: fix partial refresh invalidating the wrong region.
+  `base_view::refresh(rect)` added the widget allocation offset to the
+  `queue_draw_area` coordinates, but the drawing area is windowless so the
+  coordinates are already widget-local; the extra offset shifted every partial
+  invalidation by the decoration margin, leaving the left/top edge (e.g. a
+  first-character selection highlight) unpainted until a full expose. Use
+  widget-local coordinates, matching master.
+
+## 2026-06-02 -- 2026 integration landing (Artist 2026, Skia/Cairo, Linux/Windows, CI)
+
+**TL;DR:** The 2024 Elements line is modernized to C++20 and integrated with the
+upgraded Artist 2026 backend (Skia m148 + Cairo + Quartz2D) across macOS, Linux,
+and Windows, with the R2-based Skia binary distribution and a backend x platform
+CI matrix; master fixes are folded in and the lib/artist submodule is pointed at
+the artist develop trunk.
+
+- `f515a9ea` Elements 2024: C++20 concepts, API modernization, and documentation
+  pass. `27fdd91b` sprite button & dial styler rework (SpriteSubject concepts).
+  `5b377881` fixes: vmax_size (#424) and non-resizable window (#428).
+- `6586954e` back-merge from master (2025-09). `cb0034bb` cherry-pick master fixes
+  (#444 selection keys, #446 Asio) and cache Cairo Windows vcpkg deps.
+- `3625921a` integrate the Artist 2026 Cairo backend into Elements. `59a45730`
+  Skia 2026 sync, Linux/Windows host ports, backend x platform CI matrix.
+- `a5677fa4` Skia binary distribution: R2 vcpkg cache + prebuilt bundles +
+  compat gate + CMake presets (mirrors the artist scheme).
+- `a23edb3b` point the lib/artist submodule at artist's canonical develop trunk
+  (was on a now-retired work-branch commit; tracks `9219d1f`).
+- `5c069ed1` README: refresh the 2026 news for the unified develop trunk (unified
+  Skia + Quartz2D + Cairo on the upgraded Artist backend; default backends and the
+  automatic prebuilt-Skia fetch).

@@ -1,5 +1,5 @@
 /*=============================================================================
-   Copyright (c) 2016-2020 Joel de Guzman
+   Copyright (c) 2016-2023 Joel de Guzman
 
    Distributed under the MIT License (https://opensource.org/licenses/MIT)
 =============================================================================*/
@@ -9,7 +9,15 @@
 
 namespace elements = cycfi::elements;
 
-#define ELEMENTS_WINDOW_CLASS ELEMENTS_CLASS_PREFIX##ElementsWindow
+// Named apart from any other Elements in the process, as the view class
+// is: see base_view.mm, which also explains the two-step paste.
+#if !defined(ELEMENTS_CLASS_PREFIX)
+# define ELEMENTS_CLASS_PREFIX
+#endif
+
+#define ELEMENTS_PASTE_(a, b) a##b
+#define ELEMENTS_PASTE(a, b) ELEMENTS_PASTE_(a, b)
+#define ELEMENTS_WINDOW_CLASS ELEMENTS_PASTE(ELEMENTS_CLASS_PREFIX, ElementsWindow)
 
 @interface ELEMENTS_WINDOW_CLASS : NSWindow
 {
@@ -18,7 +26,9 @@ namespace elements = cycfi::elements;
 }
 @end
 
+#if ELEMENTS_PASTE(ELEMENTS_CLASS_PREFIX, 1) != 1
 @compatibility_alias ElementsWindow ELEMENTS_WINDOW_CLASS;
+#endif
 
 @implementation ElementsWindow
 
@@ -60,7 +70,7 @@ namespace elements = cycfi::elements;
 
 @end
 
-namespace cycfi { namespace elements
+namespace cycfi::elements
 {
    namespace
    {
@@ -94,25 +104,24 @@ namespace cycfi { namespace elements
       // Make the window background transparent
       [window_ setBackgroundColor: [NSColor colorWithCalibratedRed:0 green:0 blue:0 alpha:0]];
 
+      // A window with a title takes the frame saved under it, if there is
+      // one; else, and always without a title, the bounds.
       auto title = [window_ title];
-      if ([title length] != 0)
+      if ([title length] == 0 || ![window_ setFrameUsingName : title])
       {
-         if (![window_ setFrameUsingName : title])
-         {
-            size({ bounds.width(), bounds.height() });
-            position({ bounds.left, bounds.top });
-         }
-         else
-         {
-            NSMutableString* key =[title mutableCopy];
-            [key appendString : @"_zoom_state"];
+         size({bounds.width(), bounds.height()});
+         position({bounds.left, bounds.top});
+      }
+      else
+      {
+         NSMutableString* key =[title mutableCopy];
+         [key appendString : @"_zoom_state"];
 
-            auto zoom_state = [[NSUserDefaults standardUserDefaults] stringForKey : key];
-            if ([zoom_state isEqualToString : @"zoomed"])
-               [window_ zoom : window_];
-            else if ([zoom_state isEqualToString : @"fullscreen"])
-               [window_ toggleFullScreen : window_];
-         }
+         auto zoom_state = [[NSUserDefaults standardUserDefaults] stringForKey : key];
+         if ([zoom_state isEqualToString : @"zoomed"])
+            [window_ zoom : window_];
+         else if ([zoom_state isEqualToString : @"fullscreen"])
+            [window_ toggleFullScreen : window_];
       }
    }
 
@@ -120,29 +129,44 @@ namespace cycfi { namespace elements
    {
    }
 
+   // The size is the content's, the title bar left out, as on every host
    point window::size() const
    {
       id const& window_ = (__bridge id) _window;
-      auto const& frame = [window_ frame];
-      return { float(frame.size.width), float(frame.size.height) };
+      auto const content = [window_ contentRectForFrameRect : [window_ frame]];
+      return {float(content.size.width), float(content.size.height)};
    }
 
    void window::size(point const& p)
    {
-      id window_ = (__bridge id) _window;
-      auto frame = [window_ frame];
-      frame.size.width = p.x;
-      frame.size.height = p.y;
-      [window_ setFrame : frame display : YES animate : false];
+      auto pos = position();
+      id const window_ = (__bridge id) _window;
+      auto min = [window_ contentMinSize];
+      auto max = [window_ contentMaxSize];
+
+      auto content = [window_ contentRectForFrameRect : [window_ frame]];
+      content.size.width = std::min<float>(std::max<float>(p.x, min.width), max.width);
+      content.size.height = std::min<float>(std::max<float>(p.y, min.height), max.height);
+      [window_ setFrame : [window_ frameRectForContentRect : content] display : YES animate : false];
+      position(pos);
    }
 
    void window::limits(view_limits limits_)
    {
-      auto minx = std::max<float>(150, limits_.min.x);
-      auto miny = std::max<float>(100, limits_.min.y);
+      // A titled window keeps a usable minimum size. A bare one is the size
+      // asked for, as on the other hosts.
       id const window_ = (__bridge id) _window;
-      [window_ setContentMinSize : NSSize{ minx, miny }];
-      [window_ setContentMaxSize : NSSize{ limits_.max.x, limits_.max.y }];
+      bool const titled = [window_ styleMask] & NSWindowStyleMaskTitled;
+      auto minx = titled? std::max<float>(150, limits_.min.x) : limits_.min.x;
+      auto miny = titled? std::max<float>(100, limits_.min.y) : limits_.min.y;
+
+      // No window can be larger than the screen: content wider or taller
+      // than any (an input box asks for the full extent) gets the screen.
+      auto const screen = [[NSScreen mainScreen] visibleFrame].size;
+      clamp_max(minx, float(screen.width));
+      clamp_max(miny, float(screen.height));
+      [window_ setContentMinSize : NSSize{minx, miny}];
+      [window_ setContentMaxSize : NSSize{limits_.max.x, limits_.max.y}];
 
       clamp_min(limits_.max.x, minx);
       clamp_min(limits_.max.y, miny);
@@ -175,5 +199,5 @@ namespace cycfi { namespace elements
 
       [window_ setFrame : frame display : YES animate : false];
    }
-}}
+}
 

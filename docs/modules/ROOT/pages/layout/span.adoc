@@ -1,0 +1,125 @@
+= Span
+
+include::../common.adoc[]
+
+== Overview
+
+The span of an element is the number of columns or rows it occupies in a grid
+(see {horizontal_grids} and {vertical_grids}). The span of an element is
+determined by the element's `span` member function:
+
+[,c++]
+----
+virtual unsigned span() const;
+----
+
+By default, an element spans one column or one row. The span can be set to
+any positive integer value using the `span` function.
+
+`span` returns a `Proxy`.
+
+== Include
+
+```c++
+#include <elements/element/size.hpp>
+```
+
+[#_span_element]
+== span
+
+image::/layout/span.svg[alt="span", width=347px, role=center]
+
+Overrides the span of an enclosed element (`subject`).
+
+=== Declaration
+
+```c++
+template <concepts::Element Subject>
+class span_element : public proxy<Subject>
+{
+public:
+                           span_element(unsigned span, Subject subject);
+
+   void                    span(unsigned span);
+   unsigned                span() const;
+
+   ...
+};
+
+template <concepts::Element Subject>
+span_element<remove_cvref_t<Subject>>
+span(unsigned span, Subject&& subject);
+```
+
+The rest of `span_element` is the `Proxy` interface (see
+xref:elements/proxies.adoc[Proxies]).
+
+=== Expressions
+
+==== Notation
+
+`nspans`:: An unsigned integer
+
+`subject`:: Instance of `Element`
+
+`e`:: The element `span` returns
+
+==== Factory
+
+[cols="1,1"]
+|===
+| Expression                    | Semantics
+
+| `span(nspans, subject)`
+| The `subject` will assume a span with the given `nspans` value. An
+  `nspans` of 0 is taken as 1.
+|===
+
+==== Mutators
+
+[cols="1,1,1"]
+|===
+| Expression                    | Semantics                         | Return Type
+
+| `e.span(nspans)`
+| Set the span to `nspans`. An `nspans` of 0 is taken as 1.
+| `void`
+|===
+
+==== Accessors
+
+[cols="1,1,1"]
+|===
+| Expression                    | Semantics                         | Return Type
+
+| `e.span()`
+| Get the span.
+| `unsigned`
+|===
+
+== Example
+
+A row of three boxes in a grid of four equal columns, the middle box
+spanning two of them:
+
+```c++
+#include <elements/element/size.hpp>
+#include <elements/element/grid.hpp>        // For hgrid
+#include <elements/element/style/misc.hpp>  // For box
+...
+using namespace cycfi::elements;
+...
+auto row = hgrid(
+   box(colors::red),                   <1>
+   span(2, box(colors::green)),        <2>
+   box(colors::blue)
+);
+```
+
+<1> A box one column wide: a quarter of the row.
+<2> A box two columns wide: half of the row.
+
+'''
+
+_Copyright (c) 2014-2024 Joel de Guzman. All rights reserved._
+_Distributed under the {mit_license}_

@@ -1,0 +1,192 @@
+/*=============================================================================
+   Copyright (c) 2016-2026 Joel de Guzman
+
+   Distributed under the MIT License [ https://opensource.org/licenses/MIT ]
+
+   Shared support for the Elements test suite. Built on the headless host
+   (ELEMENTS_HOST_UI_LIBRARY=headless), a test's view has no window at all:
+   it lays out, draws and takes events from direct calls, and anything can
+   run it, with no display. Drawing goes to an offscreen image; with the
+   Artist recording backend that image keeps a journal of what was drawn.
+   On a windowing host the view is made on a real, unshown window instead.
+
+   Exactly one translation unit (test_main.cpp) defines the Catch main.
+=============================================================================*/
+#if !defined(ELEMENTS_TEST_SUPPORT_SEPTEMBER_13_2026)
+#define ELEMENTS_TEST_SUPPORT_SEPTEMBER_13_2026
+
+#if defined(_WIN32)
+# ifndef UNICODE
+#  define UNICODE
+# endif
+#endif
+
+#include <infra/catch.hpp>
+#include <elements.hpp>
+
+#if defined(ELEMENTS_HOST_UI_LIBRARY_HEADLESS)
+# include <elements/headless.hpp>
+# if defined(__APPLE__)
+#  include <CoreText/CoreText.h>
+#  include <filesystem>
+# endif
+#endif
+
+#if defined(ELEMENTS_HOST_UI_LIBRARY_GTK)
+# include <chrono>
+// From GLib, which the GTK host links; the tests have no GTK include path.
+extern "C" int g_main_context_iteration(void* context, int may_block);
+#elif defined(ELEMENTS_HOST_UI_LIBRARY_WAYLAND)
+# include <chrono>
+// From libdecor, which the Wayland host links, and the host's own context.
+struct libdecor;
+extern "C" int libdecor_dispatch(libdecor* context, int timeout);
+namespace cycfi::elements { libdecor* get_libdecor(); }
+#endif
+
+namespace cycfi::elements::test
+{
+   using artist::canvas;
+   using artist::extent;
+   using artist::offscreen_image;
+   using artist::rect;
+
+   // An element that records what it was asked to do, so a test can assert on
+   // the traversal itself rather than on pixels: how often it drew, and with
+   // what bounds.
+   struct probe_element : element
+   {
+      explicit probe_element(extent size = {20, 20}) : _size(size) {}
+
+      view_limits limits(basic_context const&) const override
+      {
+         return {{_size.x, _size.y}, {_size.x, _size.y}};
+      }
+
+      void draw(context const& ctx) override
+      {
+         ++draws;
+         last_bounds = ctx.bounds;
+      }
+
+      bool wants_control() const override   { return true; }
+
+      extent   _size;
+      int      draws = 0;
+      rect     last_bounds = {};
+   };
+
+   // On macOS the Cocoa host registers the fonts in the app bundle's
+   // resources when the first view is made. The headless host has no
+   // bundle, so the tests register the fonts the build copied next to
+   // them (test/resources) once, the same way: the icon font draws its
+   // glyphs instead of tofu.
+   inline void register_test_fonts()
+   {
+#if defined(ELEMENTS_HOST_UI_LIBRARY_HEADLESS) && defined(__APPLE__)
+      static bool const once = []
+      {
+         namespace fs = std::filesystem;
+         auto dir = fs::path{RESULTS_PATH}.parent_path().parent_path()
+            / "resources";
+         for (auto const& e : fs::directory_iterator{dir})
+         {
+            if (e.path().extension() != ".ttf")
+               continue;
+            auto url = CFURLCreateFromFileSystemRepresentation(
+               nullptr, reinterpret_cast<UInt8 const*>(e.path().c_str())
+             , e.path().string().size(), false);
+            CTFontManagerRegisterFontsForURL(url, kCTFontManagerScopeProcess, nullptr);
+            CFRelease(url);
+         }
+         return true;
+      }();
+      (void)once;
+#endif
+   }
+
+   // The clipboard's text.
+   inline void clipboard_text(std::string text)
+   {
+      set_clipboard({{"text/plain", std::move(text)}});
+   }
+
+   inline std::string clipboard_text()
+   {
+      return get_plain_text(get_clipboard({"text/plain"}));
+   }
+
+   // Whether the clipboard keeps what is put on it. The headless host's is
+   // the process's own. A real host's is the system's, shared with
+   // everything else, and another application may take it at any time:
+   // checks that go through the clipboard are made only where it works.
+   inline bool clipboard_works()
+   {
+      clipboard_text("elements test");
+      return clipboard_text() == "elements test";
+   }
+
+   // A view plus an offscreen canvas of the same size: the pair a drawing
+   // test needs.
+   struct test_view
+   {
+      // `scale` is the offscreen image's pixel density: 1 for a test that
+      // samples pixels, 2 for a figure that has to stay crisp.
+      explicit test_view(extent size = {400, 300}, float scale = 1)
+#if defined(ELEMENTS_HOST_UI_LIBRARY_HEADLESS)
+       : view_{size}
+#else
+       // On a windowing host, go through window + view the way an
+       // application does. Not every host implements view{extent}.
+       // A bare window: with no title bar or frame, its size is the view's
+       // on every host, and no system minimum for a framed window applies.
+       : win{"elements test", window::bare, {0, 0, size.x, size.y}}
+       , view_{win}
+#endif
+       , img{size.x, size.y, scale}
+       , offscr{img}
+       , cnv{offscr.context()}
+      {
+         register_test_fonts();
+#if defined(ELEMENTS_HOST_UI_LIBRARY_GTK) \
+   || defined(ELEMENTS_HOST_UI_LIBRARY_WAYLAND)
+         // GTK and Wayland size a view from their event loop, which the tests
+         // do not run. Run it until the view has its size, as a window
+         // appearing would.
+         auto const until = std::chrono::steady_clock::now()
+            + std::chrono::seconds{2};
+         while (view_.size().x < size.x
+            && std::chrono::steady_clock::now() < until)
+         {
+# if defined(ELEMENTS_HOST_UI_LIBRARY_GTK)
+            g_main_context_iteration(nullptr, 0);
+# else
+            libdecor_dispatch(get_libdecor(), 10);
+# endif
+         }
+#endif
+      }
+
+      // Draw the content once, optionally through a clip, the way a host
+      // repainting only an invalidated area does.
+      void draw(rect clip = {})
+      {
+         if (clip.width() > 0 && clip.height() > 0)
+         {
+            cnv.add_rect(clip);
+            cnv.clip();
+         }
+         view_.draw(cnv);
+      }
+
+#if !defined(ELEMENTS_HOST_UI_LIBRARY_HEADLESS)
+      window               win;
+#endif
+      view                 view_;
+      cycfi::artist::image img;
+      offscreen_image      offscr;
+      canvas               cnv;
+   };
+}
+
+#endif

@@ -1,5 +1,5 @@
 /*=============================================================================
-   Copyright (c) 2016-2020 Joel de Guzman
+   Copyright (c) 2016-2023 Joel de Guzman
 
    Distributed under the MIT License (https://opensource.org/licenses/MIT)
 =============================================================================*/
@@ -7,6 +7,7 @@
 
 using namespace cycfi::elements;
 using namespace std::chrono_literals;
+using cycfi::artist::rgba;
 
 // Main window background color
 auto constexpr bkd_color = rgba(35, 35, 37, 255);
@@ -45,7 +46,7 @@ void make_choice(view& _view, app& _app)
    auto popup = message_box2(
       _view, choice_text, icons::question, on_ok_or_cancel, on_ok_or_cancel
    );
-   _view.add(popup);
+   open_popup(popup, _view);
 }
 
 // An Alert Popup
@@ -67,12 +68,16 @@ void make_alert(view& _view, app& _app)
       };
 
    auto popup = message_box1(_view, alert_text, icons::attention, on_ok);
-   _view.add(popup);
+   open_popup(popup, _view);
 }
 
 int main(int argc, char* argv[])
 {
-   app _app(argc, argv, "Popups", "com.cycfi.popups");
+   app _app("Popups");
+
+   // Set up the fonts and search paths once, at startup, so the
+   // first window does not pay for it.
+   init_resources();
    window _win(_app.name());
    _win.on_close = [&_app]() { _app.stop(); };
 

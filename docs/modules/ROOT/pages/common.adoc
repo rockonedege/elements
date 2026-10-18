@@ -1,0 +1,42 @@
+:note-caption: ✏️ {nbsp}NOTE
+
+:tip-caption: 💡 {nbsp}TIP
+
+:important-caption: 📢 {nbsp}IMPORTANT
+
+:warning-caption: ⚠️ {nbsp}WARNING
+
+:aspects: * xref:aspects.adoc[Design Aspects]
+
+:vst: https://en.wikipedia.org/wiki/Virtual_Studio_Technology[VST]
+:au: https://en.wikipedia.org/wiki/Audio_Units[AU]
+:gtk: https://www.gtk.org/[GTK]
+:pp: {plus}{plus}
+:mit_license: https://opensource.org/licenses/MIT[MIT License]
+
+:layout: xref:layout.adoc[Layout]
+:limits: xref:layout/limits.adoc[limits]
+:view_limits: xref:layout/limits.adoc[view_limits]
+:htile: xref:layout/tiles.adoc#_htile[htile]
+:vtile: xref:layout/tiles.adoc#_vtile[vtile]
+:horizontal_grids: xref:layout/grids.adoc#_hgrid[Horizontal Grids]
+:vertical_grids: xref:layout/grids.adoc#_vgrid[Vertical Grids]
+
+:Stretch-Elements: xref:layout/stretch.adoc[Stretch]
+:Layers: xref:layout/layers.adoc[Layers]
+:Layers_Layout_Rules: xref:layout/layers.adoc#_layout_rules[Layer Layout Rules]
+:decks: xref:layout/decks.adoc[Decks]
+
+:core_elements: xref:elements.adoc[Elements]
+:element: xref:elements/element.adoc[element]
+:artist: https://cycfi.github.io/artist/artist/v1.0/index.html[Artist]
+:artist_canvas: https://cycfi.github.io/artist/artist/v1.0/canvas.html[Artist's Canvas]
+:canvas: xref:support/canvas.adoc[canvas]
+:context: xref:support/context.adoc[context]
+:basic_context: xref:support/context.adoc[basic_context]
+:theme: xref:support/theme.adoc[theme]
+:receiver: xref:support/receivers.adoc[receiver]
+
+:styles: xref:styles.adoc[Styles]
+:marks_and_scales: xref:styles/marks.adoc[Marks and Scales]
+:db_scale: xref:styles/marks.adoc#_the_decibel_scale[db_scale]

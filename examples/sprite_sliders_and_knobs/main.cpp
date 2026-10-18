@@ -1,11 +1,12 @@
 /*=============================================================================
-   Copyright (c) 2016-2020 Joel de Guzman
+   Copyright (c) 2016-2023 Joel de Guzman
 
    Distributed under the MIT License (https://opensource.org/licenses/MIT)
 =============================================================================*/
 #include <elements.hpp>
 
 using namespace cycfi::elements;
+using cycfi::artist::rgba;
 
 // Main window background color
 auto constexpr bkd_color = rgba(35, 35, 37, 255);
@@ -14,7 +15,7 @@ auto background = box(bkd_color);
 using slider_ptr = std::shared_ptr<basic_slider_base>;
 slider_ptr vsliders[3];
 
-using dial_ptr = std::shared_ptr<dial_base>;
+using dial_ptr = std::shared_ptr<basic_dial>;
 dial_ptr dials[3];
 
 template <bool is_vertical>
@@ -22,7 +23,7 @@ auto make_markers()
 {
    auto track = basic_track<5, is_vertical>();
    return slider_labels<10>(
-      slider_marks<40>(track),         // Track with marks
+      slider_marks_lin<40>(track),     // Track with marks
       0.8,                             // Label font size (relative size)
       "0", "1", "2", "3", "4",         // Labels
       "5", "6", "7", "8", "9", "10"
@@ -31,20 +32,20 @@ auto make_markers()
 
 auto make_vslider(int index)
 {
-   image slider_knob = image{ "slider-white.png", 1.0/4 };
+   image slider_knob = image{"slider-white.png", 1.0/4};
 
    vsliders[index] = share(slider(
       align_center(slider_knob),
       make_markers<true>(),
       (index + 1) * 0.25
    ));
-   return align_center(vmargin({ 20, 20 }, hold(vsliders[index])));
+   return align_center(vmargin({20, 20}, hold(vsliders[index])));
 }
 
 auto make_vsliders()
 {
    return hmin_size(250,
-      right_margin(10, htile(
+      margin_right(10, htile(
          make_vslider(0),
          make_vslider(1),
          make_vslider(2)
@@ -91,11 +92,11 @@ auto make_dials()
 auto make_controls()
 {
    return
-      margin({ 20, 10, 20, 10 },
+      margin({20, 10, 20, 10},
          vmin_size(350,
             htile(
-               margin({ 20, 20, 20, 20 }, pane("Sliders", make_vsliders(), 0.8f)),
-               hstretch(0.5, margin({ 20, 20, 20, 20 }, pane("Knobs", make_dials(), 0.8f)))
+               margin({20, 20, 20, 20}, pane("Sliders", make_vsliders(), 0.8f)),
+               hstretch(0.5, margin({20, 20, 20, 20}, pane("Knobs", make_dials(), 0.8f)))
             )
          )
       );
@@ -106,7 +107,7 @@ void link_control(int index, view& view_)
    vsliders[index]->on_change =
       [index, &view_](double val)
       {
-         dials[index]->dial_base::value(val);
+         dials[index]->basic_dial::value(val);
          view_.refresh(*dials[index]);
       };
 
@@ -127,7 +128,11 @@ void link_controls(view& view_)
 
 int main(int argc, char* argv[])
 {
-   app _app(argc, argv, "Sprite Sliders And Knobs", "com.cycfi.sprite-sliders-and-knobs");
+   app _app("Sprite Sliders And Knobs");
+
+   // Set up the fonts and search paths once, at startup, so the
+   // first window does not pay for it.
+   init_resources();
    window _win(_app.name());
    _win.on_close = [&_app]() { _app.stop(); };
 

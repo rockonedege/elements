@@ -1,5 +1,5 @@
 /*=============================================================================
-   Copyright (c) 2016-2020 Joel de Guzman
+   Copyright (c) 2016-2023 Joel de Guzman
 
    Distributed under the MIT License (https://opensource.org/licenses/MIT)
 
@@ -27,16 +27,146 @@
       distribution.
 =============================================================================*/
 #include <elements/base_view.hpp>
-#include <elements/support/canvas.hpp>
-#include <elements/support/resource_paths.hpp>
-#include <cairo.h>
-#include <cairo-win32.h>
+#include <elements/support/error_handler.hpp>
+#include <artist/canvas.hpp>
+#include <artist/resources.hpp>
+#include <system_error>
+#include <imm.h>
+#include "drag_and_drop.hpp"
+#include "transfer.hpp"
+
+#ifndef UNICODE
+# define UNICODE
+#endif
+
+#include <SDKDDKVer.h>
+#include <windows.h>
+
+#include <ShellScalingAPI.h>
 #include <Windowsx.h>
 #include <chrono>
 #include <map>
+
+#if defined(ARTIST_SKIA)
+# include <gl/gl.h>
+
+// Windows' <GL/gl.h> is frozen at OpenGL 1.1, so tokens introduced in later
+// versions are absent. Define the few we need (constant args to glGetIntegerv /
+// Skia's GrGLFramebufferInfo) rather than pull in <GL/glext.h>.
+# ifndef GL_RGBA8
+#  define GL_RGBA8 0x8058
+# endif
+# ifndef GL_FRAMEBUFFER_BINDING
+#  define GL_FRAMEBUFFER_BINDING 0x8CA6
+# endif
+
+# include <SkImage.h>
+# include <SkColorSpace.h>
+# include <SkSurface.h>
+# include <SkCanvas.h>
+# include <ganesh/GrDirectContext.h>
+# include <ganesh/GrBackendSurface.h>
+# include <ganesh/SkSurfaceGanesh.h>
+# include <ganesh/gl/GrGLInterface.h>
+# include <ganesh/gl/GrGLDirectContext.h>
+# include <ganesh/gl/GrGLBackendSurface.h>
+# include <ganesh/gl/GrGLTypes.h>
+
+// WGL ARB context-creation bits (avoid depending on <GL/wglext.h>).
+# define WGL_CONTEXT_MAJOR_VERSION_ARB    0x2091
+# define WGL_CONTEXT_MINOR_VERSION_ARB    0x2092
+# define WGL_CONTEXT_PROFILE_MASK_ARB     0x9126
+# define WGL_CONTEXT_CORE_PROFILE_BIT_ARB 0x00000001
+using PFNWGLCREATECONTEXTATTRIBSARBPROC =
+   HGLRC (WINAPI*)(HDC, HGLRC, const int*);
+#elif defined(ARTIST_CAIRO)
+# include <cairo.h>
+# include <cairo-win32.h>
+#elif defined(ARTIST_DIRECT2D)
+// The backend's own header: it hands us d2d::context (the canvas_impl) and the
+// factory the HWND render target is created from.
+# include <context.hpp>
+#endif
+
 #include "utils.hpp"
 
-namespace cycfi { namespace elements
+#include <elements/support/perf.hpp>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+
+// On a hybrid-graphics laptop the driver picks the integrated GPU unless the
+// process asks for the discrete one. Exporting these two symbols is the
+// documented way to ask: NVIDIA Optimus and AMD PowerXpress both look them up
+// in the executable. Without this, a GPU backend quietly renders on the
+// integrated chip, which is several times slower.
+extern "C"
+{
+   __declspec(dllexport) unsigned long NvOptimusEnablement = 1;
+   __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+}
+
+namespace cycfi::artist
+{
+   namespace
+   {
+      // The module that holds this code: the executable for an
+      // application, its own library for a plugin. A null handle names
+      // the process executable instead, which for a plugin is the host.
+      fs::path module_path()
+      {
+         wchar_t path[MAX_PATH];
+         HMODULE hm = nullptr;
+         constexpr auto flags =
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+
+         if (GetModuleHandleExW(flags, (LPCWSTR) &module_path, &hm))
+            if (GetModuleFileNameW(hm, path, MAX_PATH))
+               return path;
+         return {};
+      }
+
+      // Where the fonts and images sit, which differs with what is being
+      // built. An application keeps them beside itself. A plugin in a
+      // bundle, as the VST3 spec lays one out, keeps them beside the
+      // architecture directory holding the library. A plugin that is a
+      // bare library, as a CLAP is here, keeps them in a directory named
+      // after itself.
+      fs::path find_resources()
+      {
+         auto const module = module_path();
+         if (!module.empty())
+         {
+            auto const dir = module.parent_path();
+            fs::path const candidates[] =
+            {
+               dir / "resources",
+               dir.parent_path() / "Resources",
+               dir / (module.stem().string() + " Resources")
+            };
+
+            std::error_code ec;
+            for (auto const& path : candidates)
+               if (fs::is_directory(path, ec))
+                  return path;
+         }
+         return fs::current_path() / "resources";
+      }
+   }
+
+   void init_paths()
+   {
+      add_search_path(find_resources());
+   }
+
+   fs::path get_user_fonts_directory()
+   {
+      return find_resources();
+   }
+}
+
+namespace cycfi::elements
 {
    key_code translate_key(WPARAM wparam, LPARAM lparam);
 
@@ -57,7 +187,7 @@ namespace cycfi { namespace elements
       if (str.empty())
          return {};
       int size = MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), nullptr, 0);
-      std::wstring result( size, 0 );
+      std::wstring result(size, 0);
       MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), &result[0], size);
       return result;
    }
@@ -65,6 +195,8 @@ namespace cycfi { namespace elements
    namespace
    {
       constexpr unsigned IDT_TIMER1 = 100;
+
+      constexpr UINT WM_ELEMENTS_ON_OPEN = WM_APP + 1;
       HCURSOR current_cursor = nullptr;
 
       struct view_info
@@ -72,20 +204,29 @@ namespace cycfi { namespace elements
          using time_point = std::chrono::time_point<std::chrono::steady_clock>;
          using key_map = std::map<key_code, key_action>;
 
-         base_view*     vptr = nullptr;
-         bool           is_dragging = false;
-         HDC            hdc = nullptr;
-         HDC            offscreen_hdc = nullptr;
-         HBITMAP        offscreen_buff = nullptr;
-         int            w = 0;
-         int            h = 0;
-         bool           mouse_in_window = false;
-         time_point     click_start = {};
-         int            click_count = 0;
-         time_point     scroll_start = {};
-         double         velocity = 1.0;
-         point          scroll_dir;
-         key_map        keys = {};
+         base_view*     _vptr = nullptr;
+         bool           _is_dragging = false;
+         HDC            _hdc = nullptr;
+         bool           _mouse_in_window = false;
+         time_point     _click_start = {};
+         int            _click_count = 0;
+         time_point     _scroll_start = {};
+         double         _velocity = 0;
+         point          _scroll_dir = {};
+         key_map        _keys = {};
+
+#if defined(ARTIST_SKIA)
+         HDC                        _gl_dc = nullptr;   // device context for GL
+         HGLRC                      _gl_rc = nullptr;   // WGL OpenGL context
+         sk_sp<const GrGLInterface> _xface;             // Skia GL interface
+         sk_sp<GrDirectContext>     _ctx;               // Skia GL context
+         sk_sp<SkSurface>           _surface;           // Skia surface
+         int                        _surface_w = 0;
+         int                        _surface_h = 0;
+#elif defined(ARTIST_DIRECT2D)
+         // Device-dependent, so it is dropped and rebuilt on device loss.
+         ID2D1HwndRenderTarget*     _target = nullptr;
+#endif
       };
 
       view_info* get_view_info(HWND hwnd)
@@ -94,67 +235,279 @@ namespace cycfi { namespace elements
          return reinterpret_cast<view_info*>(param);
       }
 
-      void make_offscreen_dc(HDC hdc, view_info* info, int w, int h)
+#if defined(ARTIST_SKIA)
+      // Create a WGL OpenGL context on the window's DC: a double-buffered RGBA
+      // pixel format, a legacy context, then an upgrade to a core-profile 3.3
+      // context via wglCreateContextAttribsARB when available. Mirrors
+      // lib/artist/examples/host/windows/skia_app.cpp.
+      void make_gl_context(HWND hwnd, view_info* info)
       {
-         info->hdc = hdc;
-         info->w = w;
-         info->h = h;
+         auto error = [](char const* msg)
+         {
+            error_handler::get().on_render_error(error_id::graphics_context_failed, msg);
+            throw std::runtime_error(msg);
+         };
 
-         // Free-up the previous off-screen DC
-         if (info->offscreen_buff)
-            DeleteObject(info->offscreen_buff);
-         if (info->offscreen_hdc)
-            DeleteDC(info->offscreen_hdc);
+         info->_gl_dc = GetDC(hwnd);
+         if (!info->_gl_dc)
+            error("Error: GetDC failed.");
 
-         // Create an off-screen DC for double-buffering
-         info->offscreen_hdc = CreateCompatibleDC(hdc);
-         info->offscreen_buff = CreateCompatibleBitmap(hdc, w, h);
+         PIXELFORMATDESCRIPTOR pfd = {};
+         pfd.nSize = sizeof(pfd);
+         pfd.nVersion = 1;
+         pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+         pfd.iPixelType = PFD_TYPE_RGBA;
+         pfd.cColorBits = 32;
+         pfd.cAlphaBits = 8;
+         pfd.cDepthBits = 24;
+         pfd.cStencilBits = 8;
+         pfd.iLayerType = PFD_MAIN_PLANE;
+
+         int pf = ChoosePixelFormat(info->_gl_dc, &pfd);
+         if (pf == 0 || !SetPixelFormat(info->_gl_dc, pf, &pfd))
+            error("Error: SetPixelFormat failed.");
+
+         HGLRC legacy = wglCreateContext(info->_gl_dc);
+         if (!legacy)
+            error("Error: wglCreateContext failed.");
+         wglMakeCurrent(info->_gl_dc, legacy);
+
+         auto wglCreateContextAttribsARB =
+            reinterpret_cast<PFNWGLCREATECONTEXTATTRIBSARBPROC>(
+               wglGetProcAddress("wglCreateContextAttribsARB"));
+
+         if (wglCreateContextAttribsARB)
+         {
+            const int attribs[] =
+            {
+               WGL_CONTEXT_MAJOR_VERSION_ARB, 3,
+               WGL_CONTEXT_MINOR_VERSION_ARB, 3,
+               WGL_CONTEXT_PROFILE_MASK_ARB,  WGL_CONTEXT_CORE_PROFILE_BIT_ARB,
+               0
+            };
+            if (HGLRC core = wglCreateContextAttribsARB(info->_gl_dc, nullptr, attribs))
+            {
+               wglMakeCurrent(info->_gl_dc, core);
+               wglDeleteContext(legacy);
+               info->_gl_rc = core;
+            }
+         }
+         if (!info->_gl_rc)
+            info->_gl_rc = legacy;   // fall back to the legacy context
+
+         // For benchmarking, take vsync out of the picture. Left on, the driver
+         // applies back-pressure and the wait surfaces inside the flush, so the
+         // measured draw time absorbs it instead of reflecting render cost.
+         if (perf::enabled())
+         {
+            using PFNWGLSWAPINTERVALEXTPROC = BOOL (WINAPI*)(int);
+            if (auto swap_interval = reinterpret_cast<PFNWGLSWAPINTERVALEXTPROC>(
+                  wglGetProcAddress("wglSwapIntervalEXT")))
+               swap_interval(0);
+         }
+
+         if (info->_xface = GrGLMakeNativeInterface(); info->_xface == nullptr)
+            error("Error: GrGLMakeNativeInterface failed.");
+         if (info->_ctx = GrDirectContexts::MakeGL(info->_xface); info->_ctx == nullptr)
+            error("Error: GrDirectContexts::MakeGL failed.");
+
+         if (std::getenv("ELEMENTS_GL_INFO"))
+         {
+            auto s = [](GLenum e)
+            {
+               auto* p = glGetString(e);
+               return p? reinterpret_cast<char const*>(p) : "?";
+            };
+            std::fprintf(stderr, "[gl] renderer=%s | vendor=%s | version=%s\n",
+               s(GL_RENDERER), s(GL_VENDOR), s(GL_VERSION));
+         }
       }
+#endif // ARTIST_SKIA
 
       LRESULT on_paint(HWND hwnd, view_info* info)
       {
-         if (base_view* view = info->vptr)
+         if (base_view* view = info->_vptr)
          {
-            RECT dirty;
-            GetUpdateRect(hwnd, &dirty, false);
-
             PAINTSTRUCT ps;
             HDC hdc = BeginPaint(hwnd, &ps);
             SetBkMode(hdc, TRANSPARENT);
 
-            RECT r;
-            GetWindowRect(hwnd, &r);
-            auto win_width = r.right-r.left;
-            auto win_height = r.bottom-r.top;
+            auto scale = get_scale_for_window(hwnd);
 
-            if (hdc != info->hdc || win_width != info->w || win_height != info->h)
-               make_offscreen_dc(hdc, info, win_width, win_height);
+            // Only the invalidated area is repainted. ps.rcPaint is in
+            // physical pixels; the canvas draws in logical units on every
+            // backend below (Skia and Cairo scale the canvas, Direct2D
+            // scales through the target's DPI), so convert once here. A
+            // refresh(rect) that redraws the whole window otherwise costs
+            // the same as a full-window redraw.
+            rect const dirty{
+               ps.rcPaint.left / scale, ps.rcPaint.top / scale,
+               ps.rcPaint.right / scale, ps.rcPaint.bottom / scale};
+            auto clip_to_dirty = [&dirty](canvas& cnv)
+            {
+               cnv.add_rect(dirty);
+               cnv.clip();
+            };
 
-            HANDLE hold = SelectObject(info->offscreen_hdc, info->offscreen_buff);
+#if defined(ARTIST_SKIA)
+            RECT cr;
+            GetClientRect(hwnd, &cr);
+            // GetClientRect already returns physical pixels (the process is
+            // per-monitor DPI aware), which is exactly the GL framebuffer size.
+            // Do NOT multiply by scale here (that double-counts DPI and makes
+            // the surface taller than the framebuffer, clipping the top under
+            // kBottomLeft). The canvas->scale(scale) below maps the view's
+            // logical coordinates onto these physical pixels.
+            int w = int(cr.right - cr.left);
+            int h = int(cr.bottom - cr.top);
 
-            // Create the cairo surface and context.
-            cairo_surface_t* surface = cairo_win32_surface_create(info->offscreen_hdc);
+            wglMakeCurrent(info->_gl_dc, info->_gl_rc);
+
+            if (info->_surface_w != w || info->_surface_h != h)
+            {
+               info->_surface.reset();
+               info->_surface_w = w;
+               info->_surface_h = h;
+            }
+            if (!info->_surface && w > 0 && h > 0)
+            {
+               GrGLint buffer = 0;
+               glGetIntegerv(GL_FRAMEBUFFER_BINDING, &buffer);
+               GrGLFramebufferInfo fb;
+               fb.fFBOID = (GrGLuint) buffer;
+               fb.fFormat = GL_RGBA8;
+               auto target = GrBackendRenderTargets::MakeGL(w, h, 0, 8, fb);
+               info->_surface = SkSurfaces::WrapBackendRenderTarget(
+                  info->_ctx.get(), target, kBottomLeft_GrSurfaceOrigin,
+                  kRGBA_8888_SkColorType, nullptr, nullptr);
+            }
+            if (info->_surface)
+            {
+               auto _perf_t0 = std::chrono::steady_clock::now();
+               SkCanvas* gpu_canvas = info->_surface->getCanvas();
+               gpu_canvas->save();
+               gpu_canvas->scale(scale, scale);
+               auto cnv = canvas{gpu_canvas};
+               clip_to_dirty(cnv);
+               view->draw(cnv);
+               gpu_canvas->restore();
+               info->_ctx->flushAndSubmit(info->_surface.get(),
+                  perf::enabled()? GrSyncCpu::kYes : GrSyncCpu::kNo);
+               double _perf_ms = std::chrono::duration<double, std::milli>(
+                  std::chrono::steady_clock::now() - _perf_t0).count();
+               SwapBuffers(info->_gl_dc);
+               RECT client;
+               GetClientRect(hwnd, &client);
+               perf::set_pixel_size(
+                  int(client.right - client.left), int(client.bottom - client.top));
+               cycfi::elements::perf::record(_perf_ms);
+            }
+#elif defined(ARTIST_CAIRO)
+            cairo_surface_t* surface = cairo_win32_surface_create(hdc);
             cairo_t* context = cairo_create(surface);
-            view->draw(context,
-               {
-                  float(dirty.left),
-                  float(dirty.top),
-                  float(dirty.right),
-                  float(dirty.bottom)
-               }
-            );
-
-            // Cleanup.
+            cairo_scale(context, scale, scale);
+            auto _perf_t0 = std::chrono::steady_clock::now();
+            {
+               auto cnv = canvas{context};
+               clip_to_dirty(cnv);
+               view->draw(cnv);
+            }
             cairo_destroy(context);
+            cairo_surface_flush(surface);
+            double _perf_ms = std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - _perf_t0).count();
             cairo_surface_destroy(surface);
+            RECT client;
+            GetClientRect(hwnd, &client);
+            perf::set_pixel_size(
+               int(client.right - client.left), int(client.bottom - client.top));
+            cycfi::elements::perf::record(_perf_ms);
+#elif defined(ARTIST_DIRECT2D)
+            namespace d2d = cycfi::artist::d2d;
 
-            // Transfer the off-screen DC to the screen
-            auto w = dirty.right-dirty.left;
-            auto h = dirty.bottom-dirty.top;
-            BitBlt(hdc, dirty.left, dirty.top, w, h, info->offscreen_hdc
-              , dirty.left, dirty.top, SRCCOPY);
+            // Direct2D maps DIPs to pixels by DPI, so a render target DPI of
+            // 96 * scale makes one DIP one logical pixel and the view draws in
+            // logical coordinates. That is why there is no canvas scale here,
+            // unlike the Skia and Cairo paths above.
+            if (!info->_target)
+            {
+               RECT cr;
+               GetClientRect(hwnd, &cr);
+               auto px = D2D1::SizeU(cr.right - cr.left, cr.bottom - cr.top);
+               if (px.width != 0 && px.height != 0)
+               {
+                  auto props = D2D1::RenderTargetProperties(
+                     D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                     D2D1::PixelFormat(
+                        DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+                     96.0f * scale, 96.0f * scale
+                  );
+                  // Benchmarking measures render cost, so it must not be
+                  // quantised by the vblank wait EndDraw does by default.
+                  // This is the Direct2D counterpart of the Skia host's
+                  // wglSwapIntervalEXT(0).
+                  auto present = perf::enabled()?
+                     D2D1_PRESENT_OPTIONS_IMMEDIATELY : D2D1_PRESENT_OPTIONS_NONE;
 
-            SelectObject(info->offscreen_hdc, hold);
+                  d2d::get_factory().CreateHwndRenderTarget(
+                     props, D2D1::HwndRenderTargetProperties(hwnd, px, present),
+                     &info->_target);
+               }
+            }
+
+            if (info->_target)
+            {
+               // The target follows the client size here as well as in
+               // WM_SIZE. A view can change its own size while it draws, as
+               // when a zoom changes its limits, and a Resize made between
+               // BeginDraw and EndDraw fails (D2DERR_WRONG_STATE), which
+               // leaves the old size stretched into the new client area.
+               RECT cr;
+               GetClientRect(hwnd, &cr);
+               auto const client = D2D1::SizeU(cr.right - cr.left, cr.bottom - cr.top);
+               auto const target = info->_target->GetPixelSize();
+               if (client.width != target.width || client.height != target.height)
+                  info->_target->Resize(client);
+
+               // The target follows the DPI here too. A child window gets no
+               // WM_DPICHANGED under per-monitor (v1) awareness, nor inside a
+               // plugin host that chose its own awareness, so a move to a
+               // monitor of a different scale shows up only as a new DPI.
+               float dpi_x, dpi_y;
+               info->_target->GetDpi(&dpi_x, &dpi_y);
+               if (dpi_x != 96.0f * scale || dpi_y != 96.0f * scale)
+                  info->_target->SetDpi(96.0f * scale, 96.0f * scale);
+
+               info->_target->BeginDraw();
+               info->_target->SetTransform(D2D1::Matrix3x2F::Identity());
+
+               auto _perf_t0 = std::chrono::steady_clock::now();
+               {
+                  d2d::context ctx{info->_target};
+                  auto cnv = canvas{&ctx};
+                  clip_to_dirty(cnv);
+               view->draw(cnv);
+               }
+               info->_target->Flush();
+               double _perf_ms = std::chrono::duration<double, std::milli>(
+                  std::chrono::steady_clock::now() - _perf_t0).count();
+               auto hr = info->_target->EndDraw();
+
+               // The DPI scale lives in the render target, not the canvas
+               // transform, so the view's own probe (which reads the
+               // transform, as fits Skia and Cairo) under-reports here.
+               // Overrule it with the target's pixel size after the draw.
+               auto px = info->_target->GetPixelSize();
+               perf::set_pixel_size(int(px.width), int(px.height));
+
+               // Device loss: drop the device-dependent target. The next
+               // WM_PAINT recreates it and redraws from scratch.
+               if (hr == D2DERR_RECREATE_TARGET)
+                  d2d::release(info->_target);
+
+               cycfi::elements::perf::record(_perf_ms);
+            }
+#endif
             EndPaint(hwnd, &ps);
          }
          return 0;
@@ -192,7 +545,7 @@ namespace cycfi { namespace elements
          pos_x /= scale;
          pos_y /= scale;
 
-         bool down = info->is_dragging;
+         bool down = info->_is_dragging;
          switch (message)
          {
             case WM_LBUTTONDOWN:
@@ -200,15 +553,15 @@ namespace cycfi { namespace elements
             case WM_RBUTTONDOWN:
                {
                   auto now = std::chrono::steady_clock::now();
-                  auto elapsed = now - info->click_start;
-                  info->click_start = now;
+                  auto elapsed = now - info->_click_start;
+                  info->_click_start = now;
                   if (elapsed > std::chrono::milliseconds(GetDoubleClickTime()))
-                     info->click_count = 1;
+                     info->_click_count = 1;
                   else
-                     ++info->click_count;
-                  if (!info->is_dragging)
+                     ++info->_click_count;
+                  if (!info->_is_dragging)
                   {
-                     info->is_dragging = true;
+                     info->_is_dragging = true;
                      SetCapture(hwnd);
                   }
                   down = true;
@@ -219,9 +572,9 @@ namespace cycfi { namespace elements
             case WM_MBUTTONUP:
             case WM_RBUTTONUP:
                down = false;
-               if (info->is_dragging)
+               if (info->_is_dragging)
                {
-                  info->is_dragging = false;
+                  info->_is_dragging = false;
                   ReleaseCapture();
                }
                break;
@@ -251,10 +604,10 @@ namespace cycfi { namespace elements
 
          return {
             down,
-            info->click_count,
+            info->_click_count,
             which,
             get_mods(),
-            { pos_x, pos_y }
+            {pos_x, pos_y}
          };
       }
 
@@ -291,19 +644,19 @@ namespace cycfi { namespace elements
          {
             // HACK: Release both Shift keys on Shift up event, as when both
             //       are pressed the first release does not emit any event
-            bool r1 = handle_key(*info->vptr, info->keys, { key_code::left_shift, action, mods });
-            bool r2 = handle_key(*info->vptr, info->keys, { key_code::right_shift, action, mods });
+            bool r1 = handle_key(*info->_vptr, info->_keys, {key_code::left_shift, action, mods});
+            bool r2 = handle_key(*info->_vptr, info->_keys, {key_code::right_shift, action, mods});
             return r1 || r2;
          }
          else if (wparam == VK_SNAPSHOT)
          {
             // HACK: Key down is not reported for the Print Screen key
-            bool r1 = handle_key(*info->vptr, info->keys, { key, key_action::press, mods });
-            bool r2 = handle_key(*info->vptr, info->keys, { key, key_action::release, mods });
+            bool r1 = handle_key(*info->_vptr, info->_keys, {key, key_action::press, mods});
+            bool r2 = handle_key(*info->_vptr, info->_keys, {key, key_action::release, mods});
             return r1 || r2;
          }
 
-         return handle_key(*info->vptr, info->keys, { key, action, mods });
+         return handle_key(*info->_vptr, info->_keys, {key, action, mods});
       }
 
       void on_cursor(HWND hwnd, base_view* view, LPARAM lparam, cursor_tracking state)
@@ -315,32 +668,44 @@ namespace cycfi { namespace elements
          pos_x /= scale;
          pos_y /= scale;
 
-         view->cursor({ pos_x, pos_y }, state);
+         view->cursor({pos_x, pos_y}, state);
+      }
+
+      namespace
+      {
+         static auto mouse_wheel_line_delta =
+            []{
+               UINT wheel_scroll_lines;
+               SystemParametersInfoA(SPI_GETWHEELSCROLLLINES, 0, &wheel_scroll_lines, 0);
+               return float(WHEEL_DELTA) / wheel_scroll_lines;
+            }();
       }
 
       void on_scroll(HWND hwnd, view_info* info, LPARAM lparam, point dir)
       {
-         constexpr auto acceleration = 1.1;
+         static constexpr auto accel_weight = 0.1;
+         auto acceleration = 1 + (std::max(std::abs(dir.x), std::abs(dir.y)) * accel_weight);
          auto now = std::chrono::steady_clock::now();
-         auto elapsed = now - info->scroll_start;
-         info->scroll_start = now;
+         auto elapsed = now - info->_scroll_start;
+         info->_scroll_start = now;
 
          std::chrono::duration<double, std::milli> fp_ms = elapsed;
 
          bool reset_accel =
             elapsed > std::chrono::milliseconds(250) ||
-            (info->scroll_dir.x > 0 != dir.x > 0) ||
-            (info->scroll_dir.y > 0 != dir.y > 0)
+            ((info->_scroll_dir.x > 0) != (dir.x > 0)) ||
+            ((info->_scroll_dir.y > 0) != (dir.y > 0))
             ;
-         info->scroll_dir = dir;
+         info->_scroll_dir = dir;
 
          if (reset_accel)
-            info->velocity = 1.0;
+            info->_velocity = 1.0;
          else
-            info->velocity *= acceleration;
+            info->_velocity *= acceleration;
 
-         dir.x *= info->velocity;
-         dir.y *= info->velocity;
+         static constexpr auto max_velocity = 100.0;
+         dir.x *= std::min(info->_velocity, max_velocity);
+         dir.y *= std::min(info->_velocity, max_velocity);
 
          POINT pos;
          pos.x = GET_X_LPARAM(lparam);
@@ -348,7 +713,7 @@ namespace cycfi { namespace elements
          ScreenToClient(hwnd, &pos);
 
          float scale = get_scale_for_window(hwnd);
-         info->vptr->scroll(dir, { pos.x / scale, pos.y / scale });
+         info->_vptr->scroll(dir, {pos.x / scale, pos.y / scale});
       }
 
       bool on_text(base_view& view, UINT message, WPARAM wparam)
@@ -367,15 +732,19 @@ namespace cycfi { namespace elements
             return 0;
 
          if (plain)
-            return view.text({ codepoint, get_mods() });
+            return view.text({codepoint, get_mods()});
          return false;
       }
 
       LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
       {
-         constexpr auto mouse_wheel_line_delta = 120.0f;
-
          auto* info = get_view_info(hwnd);
+
+         // A window with no view: while CreateWindowW runs, before the view
+         // is stored, and after the view is gone. Nothing below can run then.
+         if (!info)
+            return DefWindowProcW(hwnd, message, wparam, lparam);
+
          switch (message)
          {
             case WM_PAINT:
@@ -392,20 +761,20 @@ namespace cycfi { namespace elements
 
             case WM_LBUTTONUP: case WM_MBUTTONUP: case WM_RBUTTONUP:
                // $$$ JDG $$$ todo: prevent double btn up and down
-               info->vptr->click(get_button(hwnd, info, message, wparam, lparam));
+               info->_vptr->click(get_button(hwnd, info, message, wparam, lparam));
                break;
 
             case WM_MOUSEMOVE:
-               if (info->is_dragging)
+               if (info->_is_dragging)
                {
-                  info->vptr->drag(get_button(hwnd, info, message, wparam, lparam));
+                  info->_vptr->drag(get_button(hwnd, info, message, wparam, lparam));
                }
                else
                {
-                  if (!info->mouse_in_window)
+                  if (!info->_mouse_in_window)
                   {
-                     on_cursor(hwnd, info->vptr, lparam, cursor_tracking::entering);
-                     info->mouse_in_window = true;
+                     on_cursor(hwnd, info->_vptr, lparam, cursor_tracking::entering);
+                     info->_mouse_in_window = true;
                   }
                   TRACKMOUSEEVENT tme;
                   tme.cbSize = sizeof(tme);
@@ -417,25 +786,25 @@ namespace cycfi { namespace elements
                break;
 
             case WM_MOUSELEAVE:
-               info->mouse_in_window = false;
-               on_cursor(hwnd, info->vptr, lparam, cursor_tracking::leaving);
+               info->_mouse_in_window = false;
+               on_cursor(hwnd, info->_vptr, lparam, cursor_tracking::leaving);
                break;
 
             case WM_MOUSEHOVER:
-               on_cursor(hwnd, info->vptr, lparam, cursor_tracking::hovering);
+               on_cursor(hwnd, info->_vptr, lparam, cursor_tracking::hovering);
                break;
 
             case WM_MOUSEWHEEL:
                {
                   float delta = GET_WHEEL_DELTA_WPARAM(wparam);
-                  on_scroll(hwnd, info, lparam, { 0, delta / mouse_wheel_line_delta });
+                  on_scroll(hwnd, info, lparam, {0, delta / mouse_wheel_line_delta});
                }
                break;
 
             case WM_MOUSEHWHEEL:
                {
                   float delta = -GET_WHEEL_DELTA_WPARAM(wparam);
-                  on_scroll(hwnd, info, lparam, { delta / mouse_wheel_line_delta, 0 });
+                  on_scroll(hwnd, info, lparam, {delta / mouse_wheel_line_delta, 0});
                }
                break;
 
@@ -446,7 +815,7 @@ namespace cycfi { namespace elements
 
             case WM_TIMER:
                if (wparam == IDT_TIMER1)
-                  info->vptr->poll();
+                  info->_vptr->poll();
                break;
 
             case WM_KEYDOWN:
@@ -468,15 +837,60 @@ namespace cycfi { namespace elements
             case WM_CHAR:
             case WM_SYSCHAR:
             case WM_UNICHAR:
-               return on_text(*info->vptr, message, wparam);
+               return on_text(*info->_vptr, message, wparam);
 
             case WM_SETFOCUS:
-               info->vptr->begin_focus();
+               info->_vptr->begin_focus();
                break;
 
             case WM_KILLFOCUS:
-               info->vptr->end_focus();
+               info->_vptr->end_focus();
                break;
+
+            case WM_SIZE:
+               if (info && info->_vptr)
+               {
+                  auto scale = get_scale_for_window(hwnd);
+#if defined(ARTIST_DIRECT2D)
+                  // Resize the back buffer to the new client size, or Direct2D
+                  // keeps the old one and bitmap-stretches it: blurry rather
+                  // than redrawn as vectors at the new resolution.
+                  if (info->_target)
+                     info->_target->Resize(D2D1::SizeU(LOWORD(lparam), HIWORD(lparam)));
+#endif
+                  info->_vptr->on_size_change(
+                     {LOWORD(lparam) / scale, HIWORD(lparam) / scale});
+               }
+               break;
+
+            case WM_DPICHANGED:
+               if (info && info->_vptr)
+               {
+                  auto scale = get_scale_for_window(hwnd);
+#if defined(ARTIST_DIRECT2D)
+                  // Keep one DIP one logical pixel on the new monitor.
+                  if (info->_target)
+                     info->_target->SetDpi(96.0f * scale, 96.0f * scale);
+#endif
+                  info->_vptr->on_scale_change(scale);
+               }
+               break;
+
+            case WM_ELEMENTS_ON_OPEN:
+               if (info && info->_vptr)
+               {
+                  RECT r;
+                  GetClientRect(hwnd, &r);
+                  auto scale = get_scale_for_window(hwnd);
+                  info->_vptr->on_open(
+                     {(r.right - r.left) / scale, (r.bottom - r.top) / scale}, scale);
+               }
+               break;
+
+            case WM_CLOSE:
+               if (info && info->_vptr)
+                  info->_vptr->on_close();
+               return DefWindowProcW(hwnd, message, wparam, lparam);
 
             default:
                return DefWindowProcW(hwnd, message, wparam, lparam);
@@ -484,14 +898,31 @@ namespace cycfi { namespace elements
          return 0;
       }
 
+      // The module that holds this code: the executable for an application,
+      // its own library for a plugin.
+      HINSTANCE this_module()
+      {
+         HMODULE hm = nullptr;
+         GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            (LPCWSTR) &WndProc, &hm
+         );
+         return hm;
+      }
+
+      // Windows keys a window class by name and module. Registering it under
+      // this module, not the process executable, gives each plugin loaded in
+      // one host a class of its own, with its own WndProc. A plugin library
+      // can be unloaded and loaded again, so the class goes with it.
       struct init_view_class
       {
          init_view_class()
          {
             WNDCLASSW windowClass = {};
-            windowClass.hbrBackground = nullptr;
+            windowClass.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH); ;
             windowClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
-            windowClass.hInstance = nullptr;
+            windowClass.hInstance = module;
             windowClass.lpfnWndProc = WndProc;
             windowClass.lpszClassName = L"ElementsView";
             windowClass.style = CS_HREDRAW | CS_VREDRAW;
@@ -499,9 +930,15 @@ namespace cycfi { namespace elements
                MessageBoxW(nullptr, L"Could not register class", L"Error", MB_OK);
 
             auto pwd = fs::current_path();
-            auto resource_path = pwd / "resources";
-            add_search_path(resource_path);
+            artist::add_search_path(pwd / "resources");
          }
+
+         ~init_view_class()
+         {
+            UnregisterClassW(L"ElementsView", module);
+         }
+
+         HINSTANCE module = this_module();
       };
    }
 
@@ -511,35 +948,60 @@ namespace cycfi { namespace elements
       {
          static init_view_class init;
 
-         HWND _view = CreateWindowW(
+         // A view on a window is its child. A view made with only a size has
+         // no window to be a child of, and Windows will not create a child
+         // without a parent, so it gets a hidden top-level window of its own.
+         auto style = parent? WS_CHILD | WS_VISIBLE : WS_POPUP;
+
+         HWND hwnd = CreateWindowW(
             L"ElementsView",
             nullptr,
-            WS_CHILD | WS_VISIBLE,
-            0, 0, 0, 0,
-            parent, nullptr, nullptr,
-            nullptr
+            style,
+            CW_USEDEFAULT, CW_USEDEFAULT, // position x, y
+            1, 1,                         // width, height
+            parent, nullptr,              // parent window, menu
+            init.module, nullptr          // instance, param
          );
+
+         auto dpi = GetDpiForWindow(hwnd);
+         AdjustWindowRectExForDpi(&bounds, style, false, WS_EX_APPWINDOW, dpi);
 
          MoveWindow(
-            _view, bounds.left, bounds.top,
-            bounds.right-bounds.left, bounds.bottom-bounds.top,
-            true // repaint
+            hwnd, bounds.left, bounds.top,
+            bounds.right - bounds.left,
+            bounds.bottom - bounds.top,
+            false
          );
 
-         view_info* info = new view_info{ _this };
-         SetWindowLongPtrW(_view, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(info));
+         view_info* info = new view_info{_this};
+         SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(info));
+
+#if defined(ARTIST_SKIA)
+         make_gl_context(hwnd, info);
+#endif
 
          // Create 1ms timer
-         SetTimer(_view, IDT_TIMER1, 1, (TIMERPROC) nullptr);
+         SetTimer(hwnd, IDT_TIMER1, 1, (TIMERPROC) nullptr);
 
-         return _view;
+         // Create and register the drop target
+         if (IDropTarget* pDropTarget = DropTarget::CreateInstance(_this, hwnd))
+         {
+            RegisterDragDrop(hwnd, pDropTarget);
+            pDropTarget->Release();
+         }
+
+         SetFocus(hwnd);
+
+         PostMessageW(hwnd, WM_ELEMENTS_ON_OPEN, 0, 0);
+         return hwnd;
       }
    }
 
    base_view::base_view(extent size_)
    {
-	   RECT bounds = { 0, 0, LONG(size_.x), LONG(size_.y) };
-	   _view = make_window(this, nullptr, bounds);
+      // Size is in logical units: size() applies the window's DPI scale.
+      _view = make_window(this, nullptr, {0, 0, 1, 1});
+      size(size_);
    }
 
    base_view::base_view(host_window_handle h)
@@ -551,17 +1013,37 @@ namespace cycfi { namespace elements
 
    base_view::~base_view()
    {
+      // Take the view off the window first, so whatever arrives while it is
+      // torn down, focus leaving, a paint, the mouse, finds no view rather
+      // than one that is gone. A plugin's editor is closed while its host
+      // carries on, so this happens every time, not only at exit.
       auto info = get_view_info(_view);
-
-      // Free-up the off-screen DC
-      if (info->offscreen_buff)
-         DeleteObject(info->offscreen_buff);
-      if (info->offscreen_hdc)
-         DeleteDC(info->offscreen_hdc);
-
+      SetWindowLongPtrW(_view, GWLP_USERDATA, 0);
       KillTimer(_view, IDT_TIMER1);
+      RevokeDragDrop(_view);
+#if defined(ARTIST_SKIA)
+      if (info)
+      {
+         // Skia frees its GPU objects through the context that is current,
+         // which with several views open may be another view's; make it
+         // this view's own first.
+         if (info->_gl_dc && info->_gl_rc)
+            wglMakeCurrent(info->_gl_dc, info->_gl_rc);
+         info->_surface.reset();
+         info->_ctx.reset();
+         info->_xface.reset();
+         wglMakeCurrent(nullptr, nullptr);
+         if (info->_gl_rc)
+            wglDeleteContext(info->_gl_rc);
+         if (info->_gl_dc)
+            ReleaseDC(_view, info->_gl_dc);
+      }
+#elif defined(ARTIST_DIRECT2D)
+      if (info)
+         cycfi::artist::d2d::release(info->_target);
+#endif
       delete info;
-      DeleteObject(_view);
+      DestroyWindow(_view);
    }
 
    point base_view::cursor_pos() const
@@ -570,23 +1052,32 @@ namespace cycfi { namespace elements
       GetCursorPos(&pos);
       ScreenToClient(_view, &pos);
       float scale = get_scale_for_window(_view);
-      return { float(pos.x) / scale, float(pos.y) / scale };
+      return {float(pos.x) / scale, float(pos.y) / scale};
    }
 
    elements::extent base_view::size() const
    {
       float scale = get_scale_for_window(_view);
       RECT r;
-      GetWindowRect(_view, &r);
-      return { float(r.right-r.left) / scale, float(r.bottom-r.top) / scale };
+      // Client area, not GetWindowRect: the view is laid out to fill the same
+      // area the GL/Cairo surface covers (the window's client area). Using the
+      // window rect (caption + borders) made the layout taller than the
+      // framebuffer, shifting all drawing up by the caption height.
+      GetClientRect(_view, &r);
+      // Truncate to whole logical pixels. At fractional DPI scales (e.g. 1.25)
+      // physical/scale is fractional (1106/1.25 = 884.8); offscreen images
+      // store an integer-sized bitmap, so a fractional view size never equals
+      // image::size() and code like rain's `offscreen->size() != size` re-inits
+      // every frame. Integer logical sizes round-trip through the bitmap.
+      return {float(int((r.right-r.left) / scale)), float(int((r.bottom-r.top) / scale))};
    }
 
    void base_view::size(elements::extent p)
    {
       auto scale = get_scale_for_window(_view);
-      auto parent = GetParent(_view);
-      RECT bounds;
-      GetClientRect(parent, &bounds);
+      RECT bounds = {0, 0, 0, 0};
+      if (auto parent = GetParent(_view))
+         GetClientRect(parent, &bounds);
 
       MoveWindow(
          _view, bounds.left, bounds.top,
@@ -613,57 +1104,123 @@ namespace cycfi { namespace elements
       InvalidateRect(_view, &r, false);
    }
 
-   float base_view::hdpi_scale() const
+   void base_view::accept_drop_types(mime_types const& types)
    {
-      return get_scale_for_window(_view);
+      _drop_types = types;
    }
 
-   std::string clipboard()
+   // Place the input method's composition window at the caret, and keep
+   // its candidate list from covering the caret's line.
+   void base_view::text_caret(rect bounds)
    {
-      if (!OpenClipboard(nullptr))
-         return {};
+      HIMC imc = ImmGetContext(_view);
+      if (!imc)
+         return;
 
-      HANDLE object = GetClipboardData(CF_UNICODETEXT);
-      if (!object)
-         return {};
+      auto scale = get_scale_for_window(_view);
+      RECT r;
+      r.left = LONG(bounds.left * scale);
+      r.top = LONG(bounds.top * scale);
+      r.right = LONG(bounds.right * scale);
+      r.bottom = LONG(bounds.bottom * scale);
 
-      WCHAR* buffer = static_cast<WCHAR*>(GlobalLock(object));
-      if (!buffer)
-         return {};
+      COMPOSITIONFORM composition = {};
+      composition.dwStyle = CFS_POINT;
+      composition.ptCurrentPos = {r.left, r.top};
+      ImmSetCompositionWindow(imc, &composition);
 
-      std::wstring source{ buffer, std::char_traits<WCHAR>::length(buffer) };
+      CANDIDATEFORM candidate = {};
+      candidate.dwIndex = 0;
+      candidate.dwStyle = CFS_EXCLUDE;
+      candidate.ptCurrentPos = {r.left, r.bottom};
+      candidate.rcArea = r;
+      ImmSetCandidateWindow(imc, &candidate);
 
-      GlobalUnlock(object);
-      CloseClipboard();
-
-      return utf8_encode(source);
+      ImmReleaseContext(_view, imc);
    }
 
-   void clipboard(std::string const& text)
+   // Nothing to do here: this host finds its resources by path and needs
+   // no registration step. Declared for every platform so a plugin may
+   // call it at load time without knowing which one it is on.
+   void init_resources()
    {
-      auto len = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
-      if (!len)
-         return;
+   }
 
-      HANDLE object = GlobalAlloc(GMEM_MOVEABLE, len * sizeof(WCHAR));
-      if (!object)
-         return;
-
-      WCHAR* buffer = static_cast<WCHAR*>(GlobalLock(object));
-      if (!buffer)
+   ////////////////////////////////////////////////////////////////////////////
+   // The clipboard
+   ////////////////////////////////////////////////////////////////////////////
+   namespace
+   {
+      // The clipboard is opened by one application at a time: wait a little
+      // for another to be done with it.
+      bool open_clipboard(HWND owner)
       {
-         GlobalFree(object);
-         return;
+         for (int i = 0; i != 20; ++i)
+         {
+            if (OpenClipboard(owner))
+               return true;
+            Sleep(5);
+         }
+         return false;
       }
 
-      MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, buffer, len);
-      GlobalUnlock(object);
+      // Setting the clipboard needs a window to own what is put on it.
+      HWND clipboard_owner()
+      {
+         static HWND const owner = CreateWindowExW(
+            0, L"STATIC", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr,
+            GetModuleHandleW(nullptr), nullptr);
+         return owner;
+      }
 
-      if (!OpenClipboard(nullptr))
+      std::vector<UINT> clipboard_formats()
+      {
+         std::vector<UINT> formats;
+         if (!open_clipboard(nullptr))
+            return formats;
+         for (UINT f = EnumClipboardFormats(0); f; f = EnumClipboardFormats(f))
+            formats.push_back(f);
+         CloseClipboard();
+         return formats;
+      }
+   }
+
+   std::vector<std::string> clipboard_types()
+   {
+      return transfer::mime_types_of(clipboard_formats());
+   }
+
+   payload get_clipboard(mime_types const& types)
+   {
+      auto available = clipboard_formats();
+      if (!open_clipboard(nullptr))
+         return {};
+      auto result = transfer::read(available, types,
+         [](UINT format)
+         {
+            return transfer::global_bytes(GetClipboardData(format));
+         });
+      CloseClipboard();
+      return result;
+   }
+
+   void set_clipboard(payload const& data)
+   {
+      if (!open_clipboard(clipboard_owner()))
          return;
-
       EmptyClipboard();
-      SetClipboardData(CF_UNICODETEXT, object);
+      for (auto const& [mime, entry] : data)
+      {
+         UINT format = transfer::format(mime);
+         auto bytes = transfer::to_bytes(format, mime, entry);
+         if (bytes.empty() && format == CF_HDROP)
+            continue;                  // no files to put there
+         if (HGLOBAL global = transfer::make_global(bytes))
+         {
+            if (!SetClipboardData(format, global))
+               GlobalFree(global);      // still ours if the clipboard did not take it
+         }
+      }
       CloseClipboard();
    }
 
@@ -694,9 +1251,52 @@ namespace cycfi { namespace elements
       }
    }
 
+   namespace
+   {
+      int get_scroll_direction()
+      {
+         const wchar_t* path = L"Software\\Microsoft\\Windows\\CurrentVersion\\PrecisionTouchPad";
+         const wchar_t* name = L"ScrollDirection";
+
+         HKEY hkey;
+
+         // Open the registry key
+         LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, path, 0, KEY_READ, &hkey);
+
+         if (result == ERROR_SUCCESS)
+         {
+            // Read the specified value from the registry
+            DWORD value;
+            DWORD dataSize = sizeof(value);
+
+            result = RegQueryValueExW(hkey, name, nullptr, nullptr, reinterpret_cast<LPBYTE>(&value), &dataSize);
+
+            // Close the registry key
+            RegCloseKey(hkey);
+
+            if (result == ERROR_SUCCESS)
+               return value == 0? 1 : -1;
+         }
+         // Return default 1 if there was an error or the value was not found
+         return 1;
+      }
+   }
+
    point scroll_direction()
    {
-      return { +1.0f, +1.0f };
+      // Read again at most every 10 seconds, in case the user changes it,
+      // as the Linux hosts do.
+      using namespace std::chrono;
+      static auto last_call = steady_clock::now();
+      static int scroll_dir = get_scroll_direction();
+
+      auto const now = steady_clock::now();
+      if (now - last_call >= seconds(10))
+      {
+         scroll_dir = get_scroll_direction();
+         last_call = now;
+      }
+      return {1.0f, 1.0f * scroll_dir};
    }
-}}
+}
 

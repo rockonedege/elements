@@ -1,118 +1,762 @@
 name: Build
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: 'Which job(s) to run'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - skia
+          - cairo
+          - quartz2d
+          - direct2d
+          - tests
+          - embed
 env:
   BUILD_TYPE: Release
 jobs:
-  build:
-    name: ${{ matrix.config.name }}
+
+  ###########################################################################
+  # Skia  (vcpkg-built Skia m148; GL on Linux/Windows, Metal host on macOS)
+  ###########################################################################
+  build-skia:
+    name: "Skia (${{ matrix.config.name }})"
+    if: >
+      github.event_name != 'workflow_dispatch' ||
+      inputs.job == 'all' ||
+      inputs.job == 'skia'
+    runs-on: ${{ matrix.config.os }}
+    permissions:
+      packages: write
+      contents: read
+    env:
+      # vcpkg binary cache, keyed by package ABI hash (compiler + portfile +
+      # triplet). Three layers, in read priority:
+      #   1. http  -> public anonymous read from Cloudflare R2 (media.cycfi.com);
+      #              this is what lets a fresh clone / fork restore with no auth.
+      #   2. x-aws -> CI-only authenticated write of new archives to the same R2
+      #              bucket via the S3 API (AWS CLI redirected by AWS_ENDPOINT_URL).
+      # A cold build (cache miss) is uploaded once via x-aws; thereafter every
+      # run, fork, and clone restores anonymously over http. (NuGet and the
+      # removed x-gha backend are no longer used.)
+      VCPKG_BINARY_SOURCES: "clear;http,https://media.cycfi.com/vcpkg-cache/{sha}.zip,read;x-aws,s3://cycfi-media/vcpkg-cache/,write"
+      # vcpkg asset cache: source archives from Cycfi's R2 mirror first,
+      # then their origins, and mirrored on the way (.github/scripts/
+      # vcpkg_asset.cmake). A new runner compiler misses the binary cache
+      # and fetches sources again; SourceForge has failed those fetches.
+      X_VCPKG_ASSET_SOURCES: "clear;x-script,cmake \"-DURL={url}\" \"-DSHA512={sha512}\" \"-DDST={dst}\" -P ${{ github.workspace }}/.github/scripts/vcpkg_asset.cmake"
+      # R2 (S3-compatible) credentials for the x-aws write layer. Withheld from
+      # fork PR runs by GitHub; x-aws write then no-ops and http read still works.
+      AWS_ENDPOINT_URL: "https://24c350f8d000d722e6bcc12e3b03469a.r2.cloudflarestorage.com"
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+        # --- x86-64 ---
+        - name: "Windows MSVC x64"
+          os: windows-latest
+          triplet: x64-windows
+        # NOTE: macOS Intel (macos-13 / x64-osx) is deferred -- GitHub is
+        # retiring Intel macOS runners (all current hosted macOS runners are
+        # arm64), so the job never gets picked up. Seed x64-osx locally from an
+        # Intel Mac with R2 write creds instead. Revisit if a runner appears.
+        - name: "Ubuntu GCC x64"
+          # 22.04 (glibc 2.35) sets the prebuilt-bundle floor — see SkiaPrebuilt.
+          os: ubuntu-22.04
+          triplet: x64-linux
+          pkg_config_path: "/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig"
+        # --- arm64 ---
+        # NOTE: windows-11-arm / arm64-windows is deferred — the VS ARM64
+        # toolchain on that runner needs a vswhere-based vcvars lookup (the
+        # hardcoded Enterprise path fails: CMAKE_C_COMPILER not set). Revisit.
+        - name: "macOS Clang arm64"
+          os: macos-latest
+          triplet: arm64-osx
+          pkg_config_path: "/opt/homebrew/lib/pkgconfig"
+        - name: "Ubuntu GCC arm64"
+          # 22.04 (glibc 2.35) sets the prebuilt-bundle floor — see SkiaPrebuilt.
+          os: ubuntu-22.04-arm
+          triplet: arm64-linux
+          pkg_config_path: "/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig"
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Resolve MSVC environment (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+        $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+        $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
+        echo "VCVARS64=$vcvars" >> $env:GITHUB_ENV
+
+    - name: Install dependencies (Ubuntu)
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          libgtk-3-dev \
+          libgl1-mesa-dev \
+          libglu1-mesa-dev \
+          libegl1-mesa-dev \
+          libharfbuzz-dev \
+          libfontconfig1-dev \
+          libfreetype6-dev \
+          x11proto-dev \
+          libx11-dev \
+          libxext-dev \
+          shared-mime-info \
+          pkg-config \
+          ninja-build \
+          autoconf \
+          autoconf-archive \
+          automake \
+          libtool \
+          zstd
+
+    - name: Install dependencies (macOS)
+      if: runner.os == 'macOS'
+      run: brew install fontconfig ninja
+
+    - name: Install dependencies (Windows)
+      if: runner.os == 'Windows'
+      run: choco install ninja
+      shell: cmd
+
+    - name: Bootstrap vcpkg (Unix)
+      if: runner.os != 'Windows'
+      run: git -C lib/artist submodule update --init --checkout lib/external/vcpkg && lib/artist/lib/external/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+
+    - name: Bootstrap vcpkg (Windows)
+      if: runner.os == 'Windows'
+      run: git -C lib/artist submodule update --init --checkout lib/external/vcpkg && lib\artist\lib\external\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+      shell: cmd
+
+    - name: Configure
+      shell: cmake -P {0}
+      run: |
+        # On Windows, import the MSVC environment (cl/link on PATH).
+        if ("${{ runner.os }}" STREQUAL "Windows")
+          execute_process(
+            COMMAND "$ENV{VCVARS64}" && set
+            OUTPUT_FILE environment_script_output.txt)
+          file(STRINGS environment_script_output.txt output_lines)
+          foreach(line IN LISTS output_lines)
+            if (line MATCHES "^([a-zA-Z0-9_-]+)=(.*)$")
+              set(ENV{${CMAKE_MATCH_1}} "${CMAKE_MATCH_2}")
+            endif()
+          endforeach()
+        endif()
+
+        set(vcpkg_toolchain
+          "$ENV{GITHUB_WORKSPACE}/lib/artist/lib/external/vcpkg/scripts/buildsystems/vcpkg.cmake")
+        # Triplet is pinned per matrix entry (the runner arch must match, or
+        # vcpkg picks a default that mislinks).
+        set(extra_args
+          -DELEMENTS_SKIA=ON
+          -DCMAKE_TOOLCHAIN_FILE=${vcpkg_toolchain}
+          -DVCPKG_MANIFEST_DIR=$ENV{GITHUB_WORKSPACE}/lib/artist
+          -DVCPKG_TARGET_TRIPLET=${{ matrix.config.triplet }})
+
+        if (NOT "${{ runner.os }}" STREQUAL "Windows")
+          # vcpkg sanitizes the environment; pass the platform pkg-config dir
+          # through so GTK / OpenGL / fontconfig / freetype / harfbuzz resolve
+          # (Homebrew on macOS, system multiarch dir on Linux).
+          set(ENV{PKG_CONFIG_PATH} "${{ matrix.config.pkg_config_path }}:$ENV{PKG_CONFIG_PATH}")
+          list(APPEND extra_args
+            -DVCPKG_ENV_PASSTHROUGH_UNTRACKED=PKG_CONFIG_PATH)
+        endif()
+
+        execute_process(
+          COMMAND ${CMAKE_COMMAND}
+            -S . -B build
+            -D CMAKE_BUILD_TYPE=$ENV{BUILD_TYPE}
+            -G Ninja
+            -D CMAKE_MAKE_PROGRAM=ninja
+            ${extra_args}
+          RESULT_VARIABLE result
+          ERROR_VARIABLE error_message)
+        if (NOT result EQUAL 0)
+          message(FATAL_ERROR "Configure failed: ${error_message} - ${result}")
+        endif()
+
+    - name: Build
+      shell: cmake -P {0}
+      run: |
+        if ("${{ runner.os }}" STREQUAL "Windows")
+          execute_process(
+            COMMAND "$ENV{VCVARS64}" && set
+            OUTPUT_FILE environment_script_output.txt)
+          file(STRINGS environment_script_output.txt output_lines)
+          foreach(line IN LISTS output_lines)
+            if (line MATCHES "^([a-zA-Z0-9_-]+)=(.*)$")
+              set(ENV{${CMAKE_MATCH_1}} "${CMAKE_MATCH_2}")
+            endif()
+          endforeach()
+        endif()
+        execute_process(
+          COMMAND ${CMAKE_COMMAND} --build build
+          RESULT_VARIABLE result ERROR_VARIABLE error_message)
+        if (NOT result EQUAL 0)
+          message(FATAL_ERROR "Build failed: ${error_message} - ${result}")
+        endif()
+
+  ###########################################################################
+  # Cairo  (system cairo on Unix; vcpkg cairo on Windows)
+  ###########################################################################
+  build-cairo:
+    name: "Cairo (${{ matrix.config.name }})"
+    if: >
+      github.event_name != 'workflow_dispatch' ||
+      inputs.job == 'all' ||
+      inputs.job == 'cairo'
+    runs-on: ${{ matrix.config.os }}
+    env:
+      # Cairo uses vcpkg only on Windows (Unix uses system cairo); its dep tree
+      # (glib/gettext/pixman/fontconfig/freetype…) is slow to cold-build, so
+      # cache it on the ABI-exact R2 vcpkg cache. No-op on the Unix cairo jobs
+      # (they never invoke vcpkg).
+      VCPKG_BINARY_SOURCES: "clear;http,https://media.cycfi.com/vcpkg-cache/{sha}.zip,read;x-aws,s3://cycfi-media/vcpkg-cache/,write"
+      # vcpkg asset cache: source archives from Cycfi's R2 mirror first,
+      # then their origins, and mirrored on the way (.github/scripts/
+      # vcpkg_asset.cmake). A new runner compiler misses the binary cache
+      # and fetches sources again; SourceForge has failed those fetches.
+      X_VCPKG_ASSET_SOURCES: "clear;x-script,cmake \"-DURL={url}\" \"-DSHA512={sha512}\" \"-DDST={dst}\" -P ${{ github.workspace }}/.github/scripts/vcpkg_asset.cmake"
+      AWS_ENDPOINT_URL: "https://24c350f8d000d722e6bcc12e3b03469a.r2.cloudflarestorage.com"
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+        - name: "Windows MSVC"
+          os: windows-latest
+        - name: "macOS Clang"
+          os: macos-latest
+        - name: "Ubuntu GCC"
+          os: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Resolve MSVC environment (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+        $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+        $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
+        echo "VCVARS64=$vcvars" >> $env:GITHUB_ENV
+
+    - name: Install dependencies (Ubuntu)
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          libcairo2-dev \
+          libgtk-3-dev \
+          libfontconfig1-dev \
+          libfreetype6-dev \
+          libharfbuzz-dev \
+          pkg-config \
+          ninja-build
+
+    - name: Install dependencies (macOS)
+      if: runner.os == 'macOS'
+      run: brew install cairo fontconfig freetype harfbuzz ninja
+
+    - name: Install dependencies (Windows)
+      if: runner.os == 'Windows'
+      run: choco install ninja
+      shell: cmd
+
+    - name: Bootstrap vcpkg (Windows)
+      if: runner.os == 'Windows'
+      run: git -C lib/artist submodule update --init --checkout lib/external/vcpkg && lib\artist\lib\external\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+      shell: cmd
+
+    - name: Configure
+      shell: cmake -P {0}
+      run: |
+        if ("${{ runner.os }}" STREQUAL "Windows")
+          execute_process(
+            COMMAND "$ENV{VCVARS64}" && set
+            OUTPUT_FILE environment_script_output.txt)
+          file(STRINGS environment_script_output.txt output_lines)
+          foreach(line IN LISTS output_lines)
+            if (line MATCHES "^([a-zA-Z0-9_-]+)=(.*)$")
+              set(ENV{${CMAKE_MATCH_1}} "${CMAKE_MATCH_2}")
+            endif()
+          endforeach()
+        endif()
+
+        # The libraries come from the system here (brew, apt) or from vcpkg
+        # on Windows, so this job keeps testing that path; Artist's prebuilt
+        # bundle is what a plain local build uses.
+        set(extra_args -DELEMENTS_CAIRO=ON -DARTIST_CAIRO_PREBUILT=OFF)
+        if ("${{ runner.os }}" STREQUAL "Windows")
+          # cairo (and its deps) come from the vcpkg manifest on Windows.
+          list(APPEND extra_args
+            -DCMAKE_TOOLCHAIN_FILE=$ENV{GITHUB_WORKSPACE}/lib/artist/lib/external/vcpkg/scripts/buildsystems/vcpkg.cmake
+            -DVCPKG_MANIFEST_DIR=$ENV{GITHUB_WORKSPACE}/lib/artist)
+        endif()
+
+        execute_process(
+          COMMAND ${CMAKE_COMMAND}
+            -S . -B build-cairo
+            -D CMAKE_BUILD_TYPE=$ENV{BUILD_TYPE}
+            -G Ninja
+            -D CMAKE_MAKE_PROGRAM=ninja
+            ${extra_args}
+          RESULT_VARIABLE result ERROR_VARIABLE error_message)
+        if (NOT result EQUAL 0)
+          message(FATAL_ERROR "Configure failed: ${error_message} - ${result}")
+        endif()
+
+    - name: Build
+      shell: cmake -P {0}
+      run: |
+        if ("${{ runner.os }}" STREQUAL "Windows")
+          execute_process(
+            COMMAND "$ENV{VCVARS64}" && set
+            OUTPUT_FILE environment_script_output.txt)
+          file(STRINGS environment_script_output.txt output_lines)
+          foreach(line IN LISTS output_lines)
+            if (line MATCHES "^([a-zA-Z0-9_-]+)=(.*)$")
+              set(ENV{${CMAKE_MATCH_1}} "${CMAKE_MATCH_2}")
+            endif()
+          endforeach()
+        endif()
+        execute_process(
+          COMMAND ${CMAKE_COMMAND} --build build-cairo
+          RESULT_VARIABLE result ERROR_VARIABLE error_message)
+        if (NOT result EQUAL 0)
+          message(FATAL_ERROR "Build failed: ${error_message} - ${result}")
+        endif()
+
+  ###########################################################################
+  # Quartz2D  (macOS only)
+  ###########################################################################
+  build-quartz2d:
+    name: "Quartz2D (macOS Clang)"
+    if: >
+      github.event_name != 'workflow_dispatch' ||
+      inputs.job == 'all' ||
+      inputs.job == 'quartz2d'
+    runs-on: macos-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install dependencies
+      run: brew install ninja
+
+    - name: Configure
+      run: |
+        cmake -S . -B build-quartz2d \
+          -DELEMENTS_QUARTZ_2D=ON \
+          -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
+          -G Ninja
+
+    - name: Build
+      run: cmake --build build-quartz2d
+
+  ###########################################################################
+  # Direct2D  (Windows only; no vcpkg: system D2D/DirectWrite/WIC, and Artist
+  # builds libwebp's decoder itself)
+  ###########################################################################
+  build-direct2d:
+    name: "Direct2D (Windows MSVC x64)"
+    if: >
+      github.event_name != 'workflow_dispatch' ||
+      inputs.job == 'all' ||
+      inputs.job == 'direct2d'
+    runs-on: windows-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install dependencies
+      run: choco install ninja
+      shell: cmd
+
+    - name: Configure and build
+      shell: cmake -P {0}
+      run: |
+        # Ask vswhere where Visual Studio is: the runner image moves between
+        # editions, and a hardcoded path silently leaves MSVC out of the
+        # environment, leaving CMake to pick the runner's MinGW instead.
+        execute_process(
+          COMMAND "C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+            -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64
+            -property installationPath
+          OUTPUT_VARIABLE vs_path
+          OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if (NOT vs_path)
+          message(FATAL_ERROR "vswhere found no Visual Studio with the x64 C++ toolset")
+        endif()
+        execute_process(
+          COMMAND "${vs_path}/VC/Auxiliary/Build/vcvars64.bat" && set
+          OUTPUT_FILE environment_script_output.txt)
+        file(STRINGS environment_script_output.txt output_lines)
+        foreach(line IN LISTS output_lines)
+          if (line MATCHES "^([a-zA-Z0-9_-]+)=(.*)$")
+            set(ENV{${CMAKE_MATCH_1}} "${CMAKE_MATCH_2}")
+          endif()
+        endforeach()
+
+        execute_process(
+          COMMAND ${CMAKE_COMMAND}
+            -S . -B build-direct2d
+            -D CMAKE_BUILD_TYPE=$ENV{BUILD_TYPE}
+            -D ELEMENTS_DIRECT2D=ON
+            -G Ninja
+            -D CMAKE_MAKE_PROGRAM=ninja
+          RESULT_VARIABLE result ERROR_VARIABLE error_message)
+        if (NOT result EQUAL 0)
+          message(FATAL_ERROR "Configure failed: ${error_message} - ${result}")
+        endif()
+        execute_process(
+          COMMAND ${CMAKE_COMMAND} --build build-direct2d
+          RESULT_VARIABLE result ERROR_VARIABLE error_message)
+        if (NOT result EQUAL 0)
+          message(FATAL_ERROR "Build failed: ${error_message} - ${result}")
+        endif()
+
+  ###########################################################################
+  # Tests  (headless host + Artist recording backend: no display, any OS)
+  ###########################################################################
+  build-tests:
+    name: "Tests (headless, ${{ matrix.config.name }})"
+    if: >
+      github.event_name != 'workflow_dispatch' ||
+      inputs.job == 'all' ||
+      inputs.job == 'tests'
+    runs-on: ${{ matrix.config.os }}
+    env:
+      # The recording backend measures text with fontconfig, FreeType and
+      # HarfBuzz. On Windows they come from Artist's vcpkg manifest, which
+      # also pulls Skia; the ABI-exact R2 cache keeps that a cache hit.
+      VCPKG_BINARY_SOURCES: "clear;http,https://media.cycfi.com/vcpkg-cache/{sha}.zip,read;x-aws,s3://cycfi-media/vcpkg-cache/,write"
+      # vcpkg asset cache: source archives from Cycfi's R2 mirror first,
+      # then their origins, and mirrored on the way (.github/scripts/
+      # vcpkg_asset.cmake). A new runner compiler misses the binary cache
+      # and fetches sources again; SourceForge has failed those fetches.
+      X_VCPKG_ASSET_SOURCES: "clear;x-script,cmake \"-DURL={url}\" \"-DSHA512={sha512}\" \"-DDST={dst}\" -P ${{ github.workspace }}/.github/scripts/vcpkg_asset.cmake"
+      AWS_ENDPOINT_URL: "https://24c350f8d000d722e6bcc12e3b03469a.r2.cloudflarestorage.com"
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+        - name: "Windows MSVC"
+          os: windows-latest
+        - name: "macOS Clang"
+          os: macos-latest
+        - name: "Ubuntu GCC"
+          os: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Resolve MSVC environment (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+        $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+        $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
+        echo "VCVARS64=$vcvars" >> $env:GITHUB_ENV
+
+    - name: Install dependencies (Ubuntu)
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          libfontconfig1-dev \
+          libfreetype6-dev \
+          libharfbuzz-dev \
+          pkg-config \
+          ninja-build
+
+    - name: Install dependencies (macOS)
+      if: runner.os == 'macOS'
+      run: brew install fontconfig freetype harfbuzz ninja
+
+    - name: Install dependencies (Windows)
+      if: runner.os == 'Windows'
+      run: choco install ninja
+      shell: cmd
+
+    - name: Bootstrap vcpkg (Windows)
+      if: runner.os == 'Windows'
+      run: git -C lib/artist submodule update --init --checkout lib/external/vcpkg && lib\artist\lib\external\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+      shell: cmd
+
+    - name: Configure
+      shell: cmake -P {0}
+      run: |
+        if ("${{ runner.os }}" STREQUAL "Windows")
+          execute_process(
+            COMMAND "$ENV{VCVARS64}" && set
+            OUTPUT_FILE environment_script_output.txt)
+          file(STRINGS environment_script_output.txt output_lines)
+          foreach(line IN LISTS output_lines)
+            if (line MATCHES "^([a-zA-Z0-9_-]+)=(.*)$")
+              set(ENV{${CMAKE_MATCH_1}} "${CMAKE_MATCH_2}")
+            endif()
+          endforeach()
+        endif()
+
+        # freetype, fontconfig and harfbuzz come from the system here (brew,
+        # apt) or from vcpkg on Windows, not from Artist's prebuilt bundle.
+        set(extra_args
+          -DELEMENTS_HOST_UI_LIBRARY=headless
+          -DELEMENTS_RECORDING=ON
+          -DARTIST_CAIRO_PREBUILT=OFF
+          -DELEMENTS_BUILD_TESTS=ON
+          -DELEMENTS_BUILD_EXAMPLES=OFF)
+        if ("${{ runner.os }}" STREQUAL "Windows")
+          list(APPEND extra_args
+            -DCMAKE_TOOLCHAIN_FILE=$ENV{GITHUB_WORKSPACE}/lib/artist/lib/external/vcpkg/scripts/buildsystems/vcpkg.cmake
+            -DVCPKG_MANIFEST_DIR=$ENV{GITHUB_WORKSPACE}/lib/artist)
+        endif()
+
+        execute_process(
+          COMMAND ${CMAKE_COMMAND}
+            -S . -B build-tests
+            -D CMAKE_BUILD_TYPE=$ENV{BUILD_TYPE}
+            -G Ninja
+            -D CMAKE_MAKE_PROGRAM=ninja
+            ${extra_args}
+          RESULT_VARIABLE result ERROR_VARIABLE error_message)
+        if (NOT result EQUAL 0)
+          message(FATAL_ERROR "Configure failed: ${error_message} - ${result}")
+        endif()
+
+    - name: Build
+      shell: cmake -P {0}
+      run: |
+        if ("${{ runner.os }}" STREQUAL "Windows")
+          execute_process(
+            COMMAND "$ENV{VCVARS64}" && set
+            OUTPUT_FILE environment_script_output.txt)
+          file(STRINGS environment_script_output.txt output_lines)
+          foreach(line IN LISTS output_lines)
+            if (line MATCHES "^([a-zA-Z0-9_-]+)=(.*)$")
+              set(ENV{${CMAKE_MATCH_1}} "${CMAKE_MATCH_2}")
+            endif()
+          endforeach()
+        endif()
+        execute_process(
+          COMMAND ${CMAKE_COMMAND} --build build-tests --target elements_test
+          RESULT_VARIABLE result ERROR_VARIABLE error_message)
+        if (NOT result EQUAL 0)
+          message(FATAL_ERROR "Build failed: ${error_message} - ${result}")
+        endif()
+
+    - name: Test
+      working-directory: build-tests/test
+      run: ctest --output-on-failure
+
+  ###########################################################################
+  # Linux hosts: Elements' tests on each windowing host (GTK, X11, Wayland)
+  # and backend (Cairo, Skia), under Xvfb or a headless weston. Mesa's
+  # llvmpipe draws for Skia, as the runners have no GPU.
+  ###########################################################################
+  build-linux-hosts:
+    name: "Linux ${{ matrix.host }} (${{ matrix.backend }})"
+    if: >
+      github.event_name != 'workflow_dispatch' ||
+      inputs.job == 'all' ||
+      inputs.job == 'tests'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        host:    [gtk, x11, wayland]
+        backend: [cairo, skia]
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          ninja-build pkg-config xvfb weston \
+          libgtk-3-dev libcairo2-dev \
+          libx11-dev libxcursor-dev libxrandr-dev \
+          libwayland-dev wayland-protocols libdecor-0-dev libxkbcommon-dev \
+          libgl1-mesa-dev libglu1-mesa-dev libegl1-mesa-dev \
+          libharfbuzz-dev libfontconfig1-dev libfreetype6-dev libwebp-dev
+
+    - name: Build
+      run: |
+        cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
+          -DELEMENTS_HOST_UI_LIBRARY=${{ matrix.host }} \
+          -DELEMENTS_$(echo ${{ matrix.backend }} | tr a-z A-Z)=ON \
+          -DELEMENTS_BUILD_TESTS=ON -DELEMENTS_BUILD_EXAMPLES=OFF
+        cmake --build build --target elements_test
+
+    - name: Test
+      working-directory: build/test
+      env:
+        LIBGL_ALWAYS_SOFTWARE: 1
+        GALLIUM_DRIVER: llvmpipe
+      run: |
+        if [ "${{ matrix.host }}" = "wayland" ]; then
+          export XDG_RUNTIME_DIR=$RUNNER_TEMP/xdg
+          mkdir -p -m 700 "$XDG_RUNTIME_DIR"
+          weston --backend=headless-backend.so --socket=ci-wayland \
+                 --no-config --idle-time=0 &
+          sleep 1
+          WAYLAND_DISPLAY=ci-wayland ./elements_test
+        else
+          xvfb-run -a ./elements_test
+        fi
+
+  ###########################################################################
+  # Embedded: two libraries, each with its own copy of Elements, embedding
+  # views in one process, as two plugins in a host (test/embed). For the
+  # hosts that embed a view in another program's window: Cocoa, Win32 and
+  # X11, on each of their backends.
+  ###########################################################################
+  build-embed:
+    name: "Embedded (${{ matrix.config.name }})"
+    if: >
+      github.event_name != 'workflow_dispatch' ||
+      inputs.job == 'all' ||
+      inputs.job == 'embed'
     runs-on: ${{ matrix.config.os }}
     strategy:
       fail-fast: false
       matrix:
         config:
-        - name: "Windows Latest MSVC"
-          os: windows-latest
-          cc: "cl"
-          cxx: "cl"
-          environment_script: "C:/Program Files (x86)/Microsoft Visual Studio/2019/Enterprise/VC/Auxiliary/Build/vcvars32.bat"
-          # If this env variable is present, we set BOOST_ROOT to its content
-        - name: "Ubuntu Latest GCC"
-          os: ubuntu-latest
-          cc: "gcc-9"
-          cxx: "g++-9"
-        - name: "macOS Latest Clang"
-          os: macos-latest
-          cc: "clang"
-          cxx: "clang++"
+        - { name: "macOS Quartz2D",   os: macos-latest,   backend: "" }
+        - { name: "macOS Skia",       os: macos-latest,   backend: ELEMENTS_SKIA }
+        - { name: "macOS Cairo",      os: macos-latest,   backend: ELEMENTS_CAIRO }
+        - { name: "Windows Direct2D", os: windows-latest, backend: "" }
+        - { name: "Windows Skia",     os: windows-latest, backend: ELEMENTS_SKIA }
+        - { name: "Windows Cairo",    os: windows-latest, backend: ELEMENTS_CAIRO }
+        - { name: "Linux X11 Cairo",  os: ubuntu-latest,  backend: ELEMENTS_CAIRO }
+        - { name: "Linux X11 Skia",   os: ubuntu-latest,  backend: ELEMENTS_SKIA }
+    env:
+      BACKEND: ${{ matrix.config.backend && format('-D{0}=ON', matrix.config.backend) || '' }}
     steps:
     - name: Checkout
-      uses: actions/checkout@v2
+      uses: actions/checkout@v4
       with:
-        submodules: 'recursive'
-    - name: Install package dependencies
-      id: cmake_and_ninja
-      shell: cmake -P {0}
+        submodules: recursive
+
+    - name: Install dependencies (macOS)
+      if: runner.os == 'macOS'
+      run: brew install pkg-config ninja
+
+    - name: Install dependencies (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
       run: |
-        if ("${{ runner.os }}" STREQUAL "Windows")
-          execute_process(COMMAND choco install ninja)
-        elseif ("${{ runner.os }}" STREQUAL "Linux")
-          execute_process(COMMAND sudo apt-get update)
-          execute_process(COMMAND sudo apt-get install libcairo2-dev)
-          execute_process(COMMAND sudo apt-get install libgtk-3-dev)
-          execute_process(COMMAND sudo apt-get install ninja-build)
-        elseif ("${{ runner.os }}" STREQUAL "macOS")
-          execute_process(COMMAND brew install pkg-config)
-          execute_process(COMMAND brew install cairo)
-          execute_process(COMMAND brew install fontconfig)
-          execute_process(COMMAND brew install bzip2)
-          execute_process(COMMAND brew install expat)
-          execute_process(COMMAND brew install zlib)
-          execute_process(COMMAND brew install libpng)
-          execute_process(COMMAND brew install ninja)
-        endif()
-    - name: Configure
-      shell: cmake -P {0}
+        choco install ninja
+        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+        $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+        $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
+        echo "VCVARS64=$vcvars" >> $env:GITHUB_ENV
+
+    - name: Install dependencies (Linux)
+      if: runner.os == 'Linux'
       run: |
-        set(ENV{CC} ${{ matrix.config.cc }})
-        set(ENV{CXX} ${{ matrix.config.cxx }})
-        # If the environment has boost_root defined, set BOOST_ROOT to it
-        if ( NOT "x${{ matrix.config.boost_root }}" STREQUAL "x")
-          set(ENV{BOOST_ROOT} $ENV{${{ matrix.config.boost_root }}})
-        endif()
+        sudo apt-get update
+        sudo apt-get install -y \
+          ninja-build pkg-config xvfb \
+          libcairo2-dev libx11-dev libxcursor-dev libxrandr-dev \
+          libgl1-mesa-dev libglu1-mesa-dev libegl1-mesa-dev \
+          libharfbuzz-dev libfontconfig1-dev libfreetype6-dev libwebp-dev
 
-        # If we are on windows, run the environment script, parse it with cmake
-        # and set environment variables with it (required for Visual Studio)
-        if ("${{ runner.os }}" STREQUAL "Windows" AND NOT "x${{ matrix.config.environment_script }}" STREQUAL "x")
-          execute_process(
-            COMMAND "${{ matrix.config.environment_script }}" && set
-            OUTPUT_FILE environment_script_output.txt
-          )
-          file(STRINGS environment_script_output.txt output_lines)
-          foreach(line IN LISTS output_lines)
-            if (line MATCHES "^([a-zA-Z0-9_-]+)=(.*)$")
-              set(ENV{${CMAKE_MATCH_1}} "${CMAKE_MATCH_2}")
-            endif()
-          endforeach()
-        endif()
-
-        execute_process(
-          COMMAND ${CMAKE_COMMAND}
-            -S .
-            -B build
-            -D CMAKE_BUILD_TYPE=$ENV{BUILD_TYPE}
-            -G Ninja
-            -D CMAKE_MAKE_PROGRAM=ninja
-          RESULT_VARIABLE result
-          ERROR_VARIABLE error_message
-        )
-
-        if (NOT result EQUAL 0)
-          message(FATAL_ERROR "Could not run with ${CMAKE_COMMAND}: Got ${error_message} - ${result}")
-        endif()
-    - name: Build
-      shell: cmake -P {0}
+    # The runner has no GPU, and Windows' own OpenGL is 1.1, too old for
+    # Skia. Mesa's opengl32.dll beside the test draws with llvmpipe.
+    - name: Mesa software OpenGL (Windows Skia)
+      if: runner.os == 'Windows' && matrix.config.backend == 'ELEMENTS_SKIA'
+      shell: bash
       run: |
-        # If we are on windows, run the environment script, parse it with cmake
-        # and set environment variables with it (required for Visual Studio)
-        if ("${{ runner.os }}" STREQUAL "Windows" AND NOT "x${{ matrix.config.environment_script }}" STREQUAL "x")
-          execute_process(
-            COMMAND "${{ matrix.config.environment_script }}" && set
-            OUTPUT_FILE environment_script_output.txt
-          )
-          file(STRINGS environment_script_output.txt output_lines)
-          foreach(line IN LISTS output_lines)
-            if (line MATCHES "^([a-zA-Z0-9_-]+)=(.*)$")
-              set(ENV{${CMAKE_MATCH_1}} "${CMAKE_MATCH_2}")
-            endif()
-          endforeach()
-        endif()
+        curl -sSL -o mesa.7z https://github.com/pal1000/mesa-dist-win/releases/download/26.2.4/mesa3d-26.2.4-release-msvc.7z
+        7z x -omesa mesa.7z x64 > /dev/null
 
-        execute_process(
-          COMMAND ${CMAKE_COMMAND} --build build
-          RESULT_VARIABLE result
-          ERROR_VARIABLE error_message
-        )
+    - name: Build and Test (macOS, Linux)
+      if: runner.os != 'Windows'
+      env:
+        LIBGL_ALWAYS_SOFTWARE: 1
+        GALLIUM_DRIVER: llvmpipe
+      run: |
+        cmake -S test/embed -B build-embed -G Ninja -DCMAKE_BUILD_TYPE=$BUILD_TYPE $BACKEND
+        cmake --build build-embed
+        if [ "${{ runner.os }}" = "Linux" ]; then
+          xvfb-run -a ctest --test-dir build-embed --output-on-failure
+        else
+          ctest --test-dir build-embed --output-on-failure
+        fi
 
-        if (NOT result EQUAL 0)
-          message(FATAL_ERROR "Could not run with ${CMAKE_COMMAND}: Got ${error_message} - ${result}")
-        endif()
+    - name: Build and Test (Windows)
+      if: runner.os == 'Windows'
+      shell: cmd
+      run: |
+        call "%VCVARS64%" || exit /b 1
+        cmake -S test/embed -B build-embed -G Ninja -DCMAKE_BUILD_TYPE=%BUILD_TYPE% %BACKEND% || exit /b 1
+        cmake --build build-embed || exit /b 1
+        if exist mesa\x64 copy /y mesa\x64\*.dll build-embed\ >nul
+        ctest --test-dir build-embed --output-on-failure || exit /b 1
+
+  ###########################################################################
+  # Status: draws this run's jobs, pass or fail, as status/build.svg on the
+  # www branch, for develop's pushes.
+  ###########################################################################
+  status:
+    name: Status
+    needs: [build-skia, build-cairo, build-quartz2d, build-direct2d, build-tests,
+            build-linux-hosts, build-embed]
+    if: >
+      always() &&
+      github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: .github/scripts
+
+    - name: Draw and publish the build grid
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh api repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs \
+          --paginate --jq '.jobs[] | {name, conclusion}' > jobs.jsonl
+        python3 .github/scripts/status_grid.py --title "Elements build" \
+          --exclude '^Status$' --out build.svg jobs.jsonl
+        bash .github/scripts/publish_status.sh build.svg

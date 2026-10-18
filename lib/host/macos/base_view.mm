@@ -1,18 +1,47 @@
 /*=============================================================================
-   Copyright (c) 2016-2020 Joel de Guzman
+   Copyright (c) 2016-2023 Joel de Guzman
 
    Distributed under the MIT License (https://opensource.org/licenses/MIT)
 =============================================================================*/
 #include <elements/base_view.hpp>
-#include <elements/support/resource_paths.hpp>
-#include <elements/support/font.hpp>
+#include <elements/support/error_handler.hpp>
+#include <artist/resources.hpp>
+#include <artist/font.hpp>
 #include <infra/assert.hpp>
 #import <Cocoa/Cocoa.h>
+#import <QuartzCore/QuartzCore.h>
 #include <dlfcn.h>
 #include <memory>
 #include <map>
-#include <cairo-quartz.h>
+#include <optional>
+#include <algorithm>
+#include <string>
+#include <utility>
+#include <vector>
 #include <infra/filesystem.hpp>
+#include <elements/support/perf.hpp>
+#include <chrono>
+
+#if defined(ARTIST_SKIA)
+# import <Metal/Metal.h>
+# import <QuartzCore/CAMetalLayer.h>
+# include <SkColorSpace.h>
+# include <SkImage.h>
+# include <SkSurface.h>
+# include <SkCanvas.h>
+# include <ganesh/GrDirectContext.h>
+# include <ganesh/GrBackendSurface.h>
+# include <ganesh/SkSurfaceGanesh.h>
+# include <ganesh/mtl/GrMtlBackendContext.h>
+# include <ganesh/mtl/GrMtlBackendSurface.h>
+# include <ganesh/mtl/GrMtlDirectContext.h>
+# include <ganesh/mtl/GrMtlTypes.h>
+#elif defined(ARTIST_CAIRO)
+# include <cairo-quartz.h>
+#elif defined(ARTIST_QUARTZ_2D)
+#else
+# error Unknown Graphics Backend
+#endif
 
 #if ! __has_feature(objc_arc)
 # error "ARC is off"
@@ -21,6 +50,7 @@
 namespace ph = cycfi::elements;
 namespace fs = cycfi::fs;
 using key_map = std::map<ph::key_code, ph::key_action>;
+using cycfi::artist::canvas;
 
 ///////////////////////////////////////////////////////////////////////////////
 // Helper utils
@@ -49,7 +79,19 @@ namespace
       CYCFI_ASSERT(furl, "Error: Unexpected missing font.");
 
       CFErrorRef error = nullptr;
-      CTFontManagerRegisterFontsForURL((__bridge CFURLRef) furl, kCTFontManagerScopeProcess, &error);
+      if (!CTFontManagerRegisterFontsForURL(
+            (__bridge CFURLRef) furl, kCTFontManagerScopeProcess, &error))
+      {
+         // A false return for an already-registered font is benign (the font is
+         // available), not a load failure -- don't report it.
+         auto code = error ? CFErrorGetCode(error) : 0;
+         if (error)
+            CFRelease(error);
+         if (code != kCTFontManagerErrorAlreadyRegistered)
+            ph::error_handler::get().on_resource_error(
+               ph::error_id::font_load_failed,
+               "font registration failed: " + font_path.string());
+      }
    }
 
    void get_resource_path(char resource_path[])
@@ -69,24 +111,36 @@ namespace
          // our resources
          char resource_path[PATH_MAX];
          get_resource_path(resource_path);
-         cycfi::elements::add_search_path(resource_path);
+         cycfi::artist::add_search_path(resource_path);
 
          // Load the user fonts from the Resource folder. Normally this is automatically
          // done on application startup, but for plugins, we need to explicitly load
          // the user fonts ourself.
-         for (fs::directory_iterator it{ resource_path }; it != fs::directory_iterator{}; ++it)
+         for (fs::directory_iterator it{resource_path}; it != fs::directory_iterator{}; ++it)
             if (it->path().extension() == ".ttf")
                activate_font(it->path());
       }
    };
 }
 
-namespace cycfi { namespace elements
+namespace cycfi::elements
 {
-   // These functions are defined in key.mm:
-   key_code    translate_key(unsigned int key);
-   int         translate_flags(NSUInteger flags);
-   NSUInteger  translate_key_to_modifier_flag(key_code key);
+   void init_resources()
+   {
+      static resource_setter init_;
+   }
+}
+
+namespace cycfi::artist
+{
+   void init_paths()
+   {
+      // Before anything else, set the working directory so we can access
+      // our resources
+      char resource_path[PATH_MAX];
+      get_resource_path(resource_path);
+      add_search_path(resource_path);
+   }
 
    // This is declared in font.hpp
    fs::path get_user_fonts_directory()
@@ -95,12 +149,26 @@ namespace cycfi { namespace elements
       get_resource_path(resource_path);
       return fs::path(resource_path);
    }
-}}
+}
+
+namespace cycfi::elements
+{
+   // These functions are defined in key.mm:
+   key_code    translate_key(unsigned int key);
+   int         translate_flags(NSUInteger flags);
+   NSUInteger  translate_key_to_modifier_flag(key_code key);
+}
 
 namespace
 {
    // Defines a constant for empty ranges in NSTextInputClient
-   NSRange const kEmptyRange = { NSNotFound, 0 };
+   NSRange const kEmptyRange = {NSNotFound, 0};
+
+   std::u32string utf32_of(NSString* s)
+   {
+      NSData* d = [s dataUsingEncoding : NSUTF32LittleEndianStringEncoding];
+      return {static_cast<char32_t const*>([d bytes]), [d length] / sizeof(char32_t)};
+   }
 
    float transformY(float y)
    {
@@ -119,7 +187,7 @@ namespace
          int(click_count),
          what,
          mods,
-         { float(pos.x), float(pos.y) }
+         {float(pos.x), float(pos.y)}
       };
    }
 
@@ -157,54 +225,392 @@ namespace
          return false;
       return _view.text(info);
    }
+
+   ////////////////////////////////////////////////////////////////////////////
+   // Pasteboards: the clipboard is the general pasteboard, and a drop comes
+   // on the dragging pasteboard. Both are read and written the same way.
+   ////////////////////////////////////////////////////////////////////////////
+
+   using type_map = std::vector<std::pair<std::string, NSPasteboardType>>;
+
+   // The MIME types with a pasteboard type of their own, which the system
+   // declares. Any other MIME type goes on the pasteboard under its own
+   // name, which the pasteboard takes as a type of its own making.
+   type_map const& known_types()
+   {
+      static type_map const types = []
+      {
+         type_map types = {
+            {"text/plain", NSPasteboardTypeString},
+            {"text/uri-list", NSPasteboardTypeFileURL},
+            {"text/html", NSPasteboardTypeHTML},
+            {"text/rtf", NSPasteboardTypeRTF},
+            {"text/csv", @"public.comma-separated-values-text"},
+            {"application/json", @"public.json"},
+            {"application/pdf", NSPasteboardTypePDF},
+            {"image/png", NSPasteboardTypePNG},
+            {"image/tiff", NSPasteboardTypeTIFF},
+            {"image/jpeg", @"public.jpeg"},
+            {"image/gif", @"com.compuserve.gif"},
+            {"image/svg+xml", @"public.svg-image"}
+         };
+         return types;
+      }();
+      return types;
+   }
+
+   NSPasteboardType pasteboard_type(std::string const& mime)
+   {
+      for (auto const& [m, type] : known_types())
+      {
+         if (m == mime)
+            return type;
+      }
+      return [NSString stringWithUTF8String : mime.c_str()];
+   }
+
+   // The MIME type of a pasteboard type, or empty if it has none: a
+   // pasteboard type of its own we do not know, or another name for one
+   // we do.
+   std::string mime_type(NSPasteboardType type)
+   {
+      for (auto const& [mime, t] : known_types())
+      {
+         if ([t isEqualToString : type])
+            return mime;
+      }
+      std::string name = [type UTF8String];
+      if (name.find('/') != std::string::npos)
+         return name;
+      return {};
+   }
+
+   std::vector<std::string> pasteboard_mime_types(NSPasteboard* pasteboard)
+   {
+      std::vector<std::string> types;
+      for (NSPasteboardType type in [pasteboard types])
+      {
+         auto mime = mime_type(type);
+         if (!mime.empty() && std::find(types.begin(), types.end(), mime) == types.end())
+            types.push_back(mime);
+      }
+      return types;
+   }
+
+   std::string file_paths(NSPasteboard* pasteboard)
+   {
+      NSDictionary* options = @{NSPasteboardURLReadingFileURLsOnlyKey:@YES};
+      NSArray* urls = [pasteboard readObjectsForClasses : @[[NSURL class]] options : options];
+      std::string paths;
+      for (NSURL* url in urls)
+      {
+         if (!paths.empty())
+            paths += "\n";
+         paths += std::string("file://") + [url fileSystemRepresentation];
+      }
+      return paths;
+   }
+
+   // Whether the pasteboard holds the MIME type. Asked of the pasteboard,
+   // not looked up in its types: it may list a type under another name of
+   // its own making.
+   bool pasteboard_has(NSPasteboard* pasteboard, std::string const& mime)
+   {
+      return [pasteboard availableTypeFromArray : @[pasteboard_type(mime)]] != nil;
+   }
+
+   ph::payload read_pasteboard(NSPasteboard* pasteboard, ph::mime_types const& types)
+   {
+      ph::payload result;
+      for (auto const& mime : types)
+      {
+         if (!pasteboard_has(pasteboard, mime))
+            continue;
+
+         if (mime == "text/plain")
+         {
+            if (NSString* text = [pasteboard stringForType : NSPasteboardTypeString])
+               result[mime] = std::string{[text UTF8String]};
+         }
+         else if (mime == "text/uri-list")
+         {
+            if (auto paths = file_paths(pasteboard); !paths.empty())
+               result[mime] = paths;
+         }
+         else if (NSData* data = [pasteboard dataForType : pasteboard_type(mime)])
+         {
+            auto const* p = static_cast<char const*>([data bytes]);
+            if (mime.substr(0, 5) == "text/")
+               result[mime] = std::string(p, [data length]);
+            else
+               result[mime] = std::vector<std::byte>(
+                  reinterpret_cast<std::byte const*>(p),
+                  reinterpret_cast<std::byte const*>(p) + [data length]);
+         }
+      }
+      return result;
+   }
+
+   NSData* as_data(ph::payload_data const& data)
+   {
+      if (auto const* s = std::get_if<std::string>(&data))
+         return [NSData dataWithBytes : s->data() length : s->size()];
+      auto const& b = std::get<std::vector<std::byte>>(data);
+      return [NSData dataWithBytes : b.data() length : b.size()];
+   }
+
+   void write_pasteboard(NSPasteboard* pasteboard, ph::payload const& data)
+   {
+      [pasteboard clearContents];
+
+      // Files go first, an item each; the other formats go on the first.
+      if (auto i = data.find("text/uri-list"); i != data.end())
+      {
+         NSMutableArray* urls = [NSMutableArray array];
+         for (auto const& path : ph::get_filepaths(data))
+         {
+            [urls addObject : [NSURL fileURLWithFileSystemRepresentation : path.c_str()
+               isDirectory : NO relativeToURL : nil]];
+         }
+         if ([urls count])
+            [pasteboard writeObjects : urls];
+      }
+
+      for (auto const& [mime, entry] : data)
+      {
+         if (mime == "text/uri-list")
+            continue;
+         if (mime == "text/plain")
+         {
+            auto text = ph::get_plain_text(data);
+            NSString* s = [[NSString alloc] initWithBytes : text.data()
+               length : text.size() encoding : NSUTF8StringEncoding];
+            if (s)
+               [pasteboard setString : s forType : NSPasteboardTypeString];
+         }
+         else
+         {
+            [pasteboard setData : as_data(entry) forType : pasteboard_type(mime)];
+         }
+      }
+   }
+
+   // The pasteboard types a view takes drops of, which it names before any
+   // drag begins: those of the MIME types its elements take, or, until it
+   // is told them, the known ones.
+   NSArray* drop_types(std::optional<ph::mime_types> const& accepted)
+   {
+      NSMutableArray* types = [NSMutableArray array];
+      if (accepted)
+      {
+         for (auto const& mime : *accepted)
+            [types addObject : pasteboard_type(mime)];
+      }
+      else
+      {
+         for (auto const& [mime, type] : known_types())
+            [types addObject : type];
+      }
+      return types;
+   }
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 // ElementsView Interface
 
-#define ELEMENTS_VIEW_CLASS ELEMENTS_CLASS_PREFIX##ElementsView
+// The Objective-C runtime keeps one flat namespace of class names for the
+// whole process, so a plugin's view class has to be named apart from any
+// other Elements in the host. ELEMENTS_CLASS_PREFIX supplies the name.
+//
+// It takes two steps to paste: ## suppresses expansion of its operands,
+// so pasting the prefix directly would name the class after the macro
+// rather than its value.
+#if !defined(ELEMENTS_CLASS_PREFIX)
+# define ELEMENTS_CLASS_PREFIX
+#endif
+
+#define ELEMENTS_PASTE_(a, b) a##b
+#define ELEMENTS_PASTE(a, b) ELEMENTS_PASTE_(a, b)
+#define ELEMENTS_VIEW_CLASS ELEMENTS_PASTE(ELEMENTS_CLASS_PREFIX, ElementsView)
 
 @interface ELEMENTS_VIEW_CLASS : NSView <NSTextInputClient>
 {
    NSTimer*                         _task;
    NSTrackingArea*                  _tracking_area;
+   NSWindow*                        _notified_window;
    NSMutableAttributedString*       _marked_text;
    key_map                          _keys;
    bool                             _start;
    ph::base_view*                   _view;
+   float                            _scale;
+
+#if defined(ARTIST_SKIA)
+   id<MTLDevice>                    _device;
+   id<MTLCommandQueue>              _queue;
+   CAMetalLayer*                    _metal_layer;
+   sk_sp<GrDirectContext>           _gr_context;
+   NSScreen*                        _last_screen;
+#else
+   NSBitmapImageRep*                _perf_rep;
+#endif
+
    bool                             _text_inserted;
+   NSRect                           _text_caret;   // in view coordinates
 }
+
+- (void) set_text_caret : (NSRect) caret;
+
 @end
 
+// The rest of this file knows the class as ElementsView. With no prefix
+// that is its name already, and an alias of a name to itself is an error,
+// so the alias is only made when there is a prefix. Pasting the prefix
+// onto 1 gives the literal 1 only when the prefix is empty; any other
+// result is an identifier, which the preprocessor takes as 0.
+#if ELEMENTS_PASTE(ELEMENTS_CLASS_PREFIX, 1) != 1
 @compatibility_alias ElementsView ELEMENTS_VIEW_CLASS;
+#endif
 
 @implementation ElementsView
 
 - (void) elements_init : (ph::base_view*) view_
 {
-   static resource_setter init_resources;
+   cycfi::elements::init_resources();
 
    _view = view_;
    _start = true;
    _task =
-      [NSTimer scheduledTimerWithTimeInterval : 0.01 // 1 millisecond quanta
+      [NSTimer scheduledTimerWithTimeInterval : 0.001 // 1 millisecond quanta
            target : self
          selector : @selector(on_tick:)
          userInfo : nil
           repeats : YES
       ];
 
+   // The common modes include event tracking, so the timer, and with it
+   // animation, keeps running while the window is resized or a menu is open.
+   [[NSRunLoop currentRunLoop] addTimer : _task forMode : NSRunLoopCommonModes];
+
    _tracking_area = nil;
    [self updateTrackingAreas];
 
    _marked_text = [[NSMutableAttributedString alloc] init];
+
+   // Measuring (ELEMENTS_PERF) renders at 1x, so the pixel count matches a
+   // scale-1 display on the other machines.
+   NSRect user = {{ 0, 0}, {100, 100}};
+   NSRect backing_bounds = [self convertRectToBacking : user];
+   _scale = cycfi::elements::perf::enabled()?
+      1.0f : backing_bounds.size.height / user.size.height;
+
+#if defined(ARTIST_SKIA)
+   // Metal device and command queue.
+   _device = MTLCreateSystemDefaultDevice();
+   if (!_device)
+   {
+      ph::error_handler::get().on_render_error(
+         ph::error_id::no_gpu_device, "No Metal device found");
+      throw std::runtime_error{"No Metal device found"};
+   }
+   _queue = [_device newCommandQueue];
+
+   // A render-on-demand CAMetalLayer added as a *sublayer*. The view itself
+   // stays layer-backed (not layer-hosting), so it keeps receiving drawRect:
+   // from Elements' setNeedsDisplay:-driven invalidation; rendering happens in
+   // the ARTIST_SKIA branch of drawRect:.
+   _metal_layer = [CAMetalLayer layer];
+   _metal_layer.device           = _device;
+   _metal_layer.pixelFormat      = MTLPixelFormatBGRA8Unorm;
+   _metal_layer.framebufferOnly  = NO;
+   _metal_layer.contentsGravity  = kCAGravityTopLeft;
+   _metal_layer.contentsScale    = _scale;
+   _metal_layer.frame            = self.bounds;
+   // Disable implicit CoreAnimation actions on the Metal sublayer: otherwise a
+   // frame/bounds/position change (done every drawRect to track the view) is
+   // animated over ~0.25s, so during live resize the layer lags the view and
+   // snaps into place -- the gap-below-titlebar rubber-band on the Skia backend.
+   _metal_layer.actions = @{
+      @"frame"    : [NSNull null],
+      @"bounds"   : [NSNull null],
+      @"position" : [NSNull null],
+      @"contents" : [NSNull null]
+   };
+
+   self.wantsLayer = YES;
+   [self.layer addSublayer : _metal_layer];
+
+   // Skia GrDirectContext over Metal.
+   GrMtlBackendContext backend{};
+   backend.fDevice.retain((__bridge GrMTLHandle)_device);
+   backend.fQueue.retain((__bridge GrMTLHandle)_queue);
+   _gr_context = GrDirectContexts::MakeMetal(backend);
+   if (!_gr_context)
+   {
+      ph::error_handler::get().on_render_error(
+         ph::error_id::graphics_context_failed,
+         "Failed to create Skia Metal GrDirectContext");
+      throw std::runtime_error{"Failed to create Skia Metal GrDirectContext"};
+   }
+#endif
+
+   [self setPostsBoundsChangedNotifications : YES];
    _text_inserted = false;
+
+   [self registerForDraggedTypes : drop_types(std::nullopt)];
 }
 
 - (void) dealloc
 {
+   [[NSNotificationCenter defaultCenter] removeObserver : self];
    _task = nil;
    _view = nullptr;
+#if defined(ARTIST_SKIA)
+   _gr_context.reset();
+#endif
+}
+
+- (void) viewDidMoveToWindow
+{
+   if (self.window)
+   {
+      [self attach_window_notifications];
+      [[self window] makeFirstResponder : self];
+   }
+   else
+   {
+      [self detach_window_notifications];
+   }
+}
+
+- (void) setFrameSize : (NSSize) newSize
+{
+   [super setFrameSize : newSize];
+   if (_view)
+      _view->on_size_change({float(newSize.width), float(newSize.height)});
+}
+
+- (void) viewDidChangeBackingProperties
+{
+   [super viewDidChangeBackingProperties];
+   if (cycfi::elements::perf::enabled())
+      return;
+   NSRect user = {{0, 0}, {100, 100}};
+   NSRect backing = [self convertRectToBacking : user];
+   float scale = backing.size.height / user.size.height;
+   if (scale != _scale)
+   {
+      _scale = scale;
+#if defined(ARTIST_SKIA)
+      _metal_layer.contentsScale = _scale;
+#endif
+      if (_view)
+         _view->on_scale_change(_scale);
+   }
+}
+
+- (float) hdpi_scale
+{
+   return _scale;
 }
 
 - (void) on_tick : (id) sender
@@ -212,41 +618,146 @@ namespace
    _view->poll();
 }
 
-- (void) attach_notifications
+// The window notifications follow the window the view is in, which a view
+// made before it is parented (a plugin editor) does not have yet. They are
+// attached when the view lands in a window and detached when it leaves,
+// never with a nil window: that would mean every window, and a removal
+// later, naming the window, would not find them.
+- (void) attach_window_notifications
 {
-   [[NSNotificationCenter defaultCenter]
+   auto* window_ = [self window];
+   if (!window_ || window_ == _notified_window)
+      return;
+   [self detach_window_notifications];
+
+   auto* center = [NSNotificationCenter defaultCenter];
+
+   [center
       addObserver : self
          selector : @selector(windowDidBecomeKey:)
              name : NSWindowDidBecomeKeyNotification
-           object : [self window]
+           object : window_
    ];
 
-   [[NSNotificationCenter defaultCenter]
+   [center
       addObserver : self
          selector : @selector(windowDidResignKey:)
              name : NSWindowDidResignMainNotification
-           object : [self window]
+           object : window_
    ];
+
+   [center
+      addObserver : self
+         selector : @selector(windowWillClose:)
+             name : NSWindowWillCloseNotification
+           object : window_
+   ];
+
+#if defined(ARTIST_SKIA)
+   [center
+      addObserver : self
+         selector : @selector(windowDidMove:)
+             name : NSWindowDidMoveNotification
+           object : window_
+   ];
+#endif
+
+   _notified_window = window_;
 }
+
+- (void) detach_window_notifications
+{
+   if (!_notified_window)
+      return;
+
+   auto* center = [NSNotificationCenter defaultCenter];
+   [center
+      removeObserver : self
+                name : NSWindowDidBecomeKeyNotification
+              object : _notified_window
+   ];
+   [center
+      removeObserver : self
+                name : NSWindowDidResignMainNotification
+              object : _notified_window
+   ];
+   [center
+      removeObserver : self
+                name : NSWindowWillCloseNotification
+              object : _notified_window
+   ];
+   [center
+      removeObserver : self
+                name : NSWindowDidMoveNotification
+              object : _notified_window
+   ];
+   _notified_window = nil;
+}
+
+- (void) attach_notifications
+{
+   [self attach_window_notifications];
+
+#if defined(ARTIST_SKIA)
+   auto* center = [NSNotificationCenter defaultCenter];
+   // AppKit terminates by calling exit() without deallocating the view, so the
+   // Skia GrDirectContext would otherwise be destroyed during C++ static
+   // teardown with live GPU resources — tripping Skia's debug leak assert.
+   // Release it explicitly while Metal is still valid.
+   [center
+      addObserver : self
+         selector : @selector(applicationWillTerminate:)
+             name : NSApplicationWillTerminateNotification
+           object : nil
+   ];
+
+   _last_screen = self.window.screen;
+#endif
+
+   // Deferred so on_open runs after construction (see logging docs).
+   __weak ElementsView* weak_self = self;
+   dispatch_async(dispatch_get_main_queue(), ^{
+      ElementsView* strong_self = weak_self;
+      if (strong_self && strong_self->_view)
+      {
+         auto b = [strong_self bounds].size;
+         strong_self->_view->on_open(
+            {float(b.width), float(b.height)}, strong_self->_scale);
+      }
+   });
+}
+
+#if defined(ARTIST_SKIA)
+- (void) applicationWillTerminate : (NSNotification*) notification
+{
+   if (_gr_context)
+   {
+      _gr_context->releaseResourcesAndAbandonContext();
+      _gr_context.reset();
+   }
+   _metal_layer = nil;
+}
+#endif
 
 - (void) detach_notifications
 {
-   [[NSNotificationCenter defaultCenter]
-      removeObserver : self
-                name : NSWindowDidBecomeKeyNotification
-              object : [self window]
-   ];
-
-   [[NSNotificationCenter defaultCenter]
-      removeObserver : self
-                name : NSWindowDidResignMainNotification
-              object : [self window]
-   ];
+   [self detach_window_notifications];
+   // Whatever else was registered, gone with the view.
+   [[NSNotificationCenter defaultCenter] removeObserver : self];
 }
 
 - (void) detach_timer
 {
    [_task invalidate];
+}
+
+// The C++ view is gone. A host may keep this NSView alive past it, and the
+// deferred on_open, queued in attach_notifications, may still run; it
+// checks _view. The rest stop with the C++ view: the timer is invalidated,
+// and a view out of its window gets no drawing or events.
+- (void) elements_detach
+{
+   _view = nullptr;
 }
 
 - (BOOL) canBecomeKeyView
@@ -266,17 +777,87 @@ namespace
 
 - (BOOL) canBecomeKeyWindow
 {
-    return YES;
+   return YES;
 }
 
 - (BOOL) canBecomeMainWindow
 {
-    return YES;
+   return YES;
 }
 
 - (void) drawRect : (NSRect)dirty
 {
    [super drawRect : dirty];
+
+#if defined(ARTIST_QUARTZ_2D)
+
+   auto context = NSGraphicsContext.currentContext.CGContext;
+   auto cnv = canvas{(cycfi::artist::canvas_impl*) context};
+   auto _perf_t0 = std::chrono::steady_clock::now();
+   _view->draw(cnv);
+   CGContextFlush(context);
+   if (!cycfi::elements::perf::enabled())
+   {
+      auto const b = [self bounds];
+      cycfi::elements::perf::set_pixel_size(
+         int(b.size.width * _scale + 0.5f), int(b.size.height * _scale + 0.5f));
+      cycfi::elements::perf::record(
+         std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - _perf_t0).count());
+   }
+
+#elif defined(ARTIST_SKIA)
+
+
+   // Keep the Metal layer sized to the view (handles HiDPI + live resize).
+   auto bounds = [self bounds];
+   _metal_layer.frame = bounds;
+   int w = int(std::ceil(bounds.size.width  * _scale));
+   int h = int(std::ceil(bounds.size.height * _scale));
+   if (w <= 0 || h <= 0)
+      return;
+   if (int(_metal_layer.drawableSize.width) != w ||
+       int(_metal_layer.drawableSize.height) != h)
+      _metal_layer.drawableSize = CGSizeMake(w, h);
+
+   if (cycfi::elements::perf::enabled())
+      _metal_layer.displaySyncEnabled = NO;   // measure throughput, not refresh
+   id<CAMetalDrawable> drawable = [_metal_layer nextDrawable];
+   if (drawable && _gr_context)
+   {
+      GrMtlTextureInfo tex_info;
+      tex_info.fTexture.retain((__bridge GrMTLHandle)drawable.texture);
+      auto backend_rt = GrBackendRenderTargets::MakeMtl(w, h, tex_info);
+
+      auto surface = SkSurfaces::WrapBackendRenderTarget(
+         _gr_context.get(), backend_rt,
+         kTopLeft_GrSurfaceOrigin,     // Metal: Y=0 at top, no flip needed
+         kBGRA_8888_SkColorType, nullptr, nullptr);
+
+      if (surface)
+      {
+         auto _perf_t0 = std::chrono::steady_clock::now();
+         SkCanvas* gpu_canvas = surface->getCanvas();
+         gpu_canvas->save();
+         gpu_canvas->scale(_scale, _scale);
+         auto cnv = canvas{gpu_canvas};
+         _view->draw(cnv);
+         gpu_canvas->restore();
+
+         _gr_context->flushAndSubmit(surface.get(),
+            cycfi::elements::perf::enabled()? GrSyncCpu::kYes : GrSyncCpu::kNo);
+         double _perf_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - _perf_t0).count();
+
+         id<MTLCommandBuffer> cmd = [_queue commandBuffer];
+         [cmd presentDrawable : drawable];
+         [cmd commit];
+         cycfi::elements::perf::set_pixel_size(w, h);
+         cycfi::elements::perf::record(_perf_ms);
+      }
+   }
+#elif defined(ARTIST_CAIRO)
+
 
    auto w = [self bounds].size.width;
    auto h = [self bounds].size.height;
@@ -285,17 +866,22 @@ namespace
    cairo_surface_t* surface = cairo_quartz_surface_create_for_cg_context(context_ref, w, h);
    cairo_t* context = cairo_create(surface);
 
-   _view->draw(context,
-      {
-         float(dirty.origin.x),
-         float(dirty.origin.y),
-         float(dirty.origin.x + dirty.size.width),
-         float(dirty.origin.y + dirty.size.height)
-      }
-   );
+   auto cnv = canvas{context};
+   auto _perf_t0 = std::chrono::steady_clock::now();
+   _view->draw(cnv);
+   cairo_surface_flush(surface);
+   CGContextFlush(context_ref);
+   double _perf_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - _perf_t0).count();
 
    cairo_surface_destroy(surface);
    cairo_destroy(context);
+   if (!cycfi::elements::perf::enabled())
+   {
+      cycfi::elements::perf::set_pixel_size(int(w * _scale + 0.5f), int(h * _scale + 0.5f));
+      cycfi::elements::perf::record(_perf_ms);
+   }
+#endif
 }
 
 - (void) mouseDown : (NSEvent*) event
@@ -387,10 +973,9 @@ namespace
 - (void) mouseEntered : (NSEvent*) event
 {
    [[self window] setAcceptsMouseMovedEvents : YES];
-   [[self window] makeFirstResponder : self];
    auto pos = [event locationInWindow];
    pos = [self convertPoint : pos fromView : nil];
-   _view->cursor({ float(pos.x), float(pos.y) }, ph::cursor_tracking::entering);
+   _view->cursor({float(pos.x), float(pos.y)}, ph::cursor_tracking::entering);
    [self displayIfNeeded];
 }
 
@@ -399,7 +984,7 @@ namespace
    [[self window] setAcceptsMouseMovedEvents : NO];
    auto pos = [event locationInWindow];
    pos = [self convertPoint : pos fromView : nil];
-   _view->cursor({ float(pos.x), float(pos.y) }, ph::cursor_tracking::leaving);
+   _view->cursor({float(pos.x), float(pos.y)}, ph::cursor_tracking::leaving);
    [self displayIfNeeded];
 }
 
@@ -407,7 +992,7 @@ namespace
 {
    auto pos = [event locationInWindow];
    pos = [self convertPoint : pos fromView : nil];
-   _view->cursor({ float(pos.x), float(pos.y) }, ph::cursor_tracking::hovering);
+   _view->cursor({float(pos.x), float(pos.y)}, ph::cursor_tracking::hovering);
    [self displayIfNeeded];
    [super mouseMoved: event];
 }
@@ -420,19 +1005,64 @@ namespace
    auto pos = [event locationInWindow];
    pos = [self convertPoint:pos fromView:nil];
    if (fabs(delta_x) > 0.0 || fabs(delta_y) > 0.0)
-      _view->scroll({ delta_x, delta_y }, { float(pos.x), float(pos.y) });
+      _view->scroll({delta_x, delta_y}, {float(pos.x), float(pos.y)});
    [self displayIfNeeded];
 }
 
 - (void) keyDown : (NSEvent*) event
 {
-   auto const key = ph::translate_key([event keyCode]);
-   auto const mods = ph::translate_flags([event modifierFlags]);
-   bool handled = handle_key(_keys, *_view, { key, ph::key_action::press, mods });
+   auto key = ph::translate_key([event keyCode]);
+   auto mods = ph::translate_flags([event modifierFlags]);
+
+   // MacOS specific translations
+   if (key == ph::key_code::up && (mods & ph::mod_action))
+   {
+      mods &= ~ph::mod_action;
+      key = ph::key_code::home;
+   }
+   else if (key == ph::key_code::down && (mods & ph::mod_action))
+   {
+      mods &= ~ph::mod_action;
+      key = ph::key_code::end;
+   }
+   // While an input method is composing, its keys are its own: Return,
+   // the arrows and Backspace work on the composition, not the text.
+   if ([self hasMarkedText])
+   {
+      [self interpretKeyEvents : [NSArray arrayWithObject : event]];
+      return;
+   }
+
+   bool handled = handle_key(_keys, *_view, {key, ph::key_action::press, mods});
    _text_inserted = false;
    [self interpretKeyEvents : [NSArray arrayWithObject : event]];
    if (!handled && !_text_inserted)
       [[self nextResponder] keyUp : event];
+}
+
+// A key struck with Command is a key equivalent, and Cocoa offers it to
+// the key window's views and then to the menus before it would ever
+// arrive as keyDown. A view hosted in another application, a plugin in
+// a DAW say, never sees such a key through keyDown at all: the host's
+// own commands take it first. Claiming it here, the view is asked
+// first. Only a Command chord is looked at, and only one the view
+// handles is claimed; the rest go on to the host as before.
+- (BOOL) performKeyEquivalent : (NSEvent*) event
+{
+   if (!([event modifierFlags] & NSEventModifierFlagCommand))
+      return [super performKeyEquivalent : event];
+
+   auto key = ph::translate_key([event keyCode]);
+   auto mods = ph::translate_flags([event modifierFlags]);
+   if (handle_key(_keys, *_view, {key, ph::key_action::press, mods}))
+   {
+      // The release never comes as an event of its own, so it is
+      // recorded now, or the next press of the key would read as a
+      // repeat.
+      _keys[key] = ph::key_action::release;
+      return YES;
+   }
+   return [super performKeyEquivalent : event];
 }
 
 - (void) flagsChanged : (NSEvent*) event
@@ -456,7 +1086,7 @@ namespace
      action = ph::key_action::release;
    }
 
-   handle_key(_keys, *_view, { key, action, mods });
+   handle_key(_keys, *_view, {key, action, mods});
 }
 
 - (void) keyUp : (NSEvent*) event
@@ -464,7 +1094,7 @@ namespace
    auto const key = ph::translate_key([event keyCode]);
    auto const mods = ph::translate_flags([event modifierFlags]);
 
-   bool handled = handle_key(_keys, *_view, { key, ph::key_action::release, mods });
+   bool handled = handle_key(_keys, *_view, {key, ph::key_action::release, mods});
    if (!handled)
       [[self nextResponder] keyUp : event];
 }
@@ -477,7 +1107,7 @@ namespace
 - (NSRange) markedRange
 {
    if ([_marked_text length] > 0)
-      return NSMakeRange(0, [_marked_text length] - 1);
+      return NSMakeRange(0, [_marked_text length]);
    else
       return kEmptyRange;
 }
@@ -495,11 +1125,24 @@ namespace
       (void)[_marked_text initWithAttributedString:string];
    else
       (void)[_marked_text initWithString:string];
+
+   NSString* text = [_marked_text string];
+   auto const upto = std::min<NSUInteger>(selectedRange.location, [text length]);
+   ph::composition_info info;
+   info.text = utf32_of(text);
+   info.cursor = utf32_of([text substringToIndex : upto]).size();
+   _view->composition(info);
 }
 
 - (void) unmarkText
 {
    [[_marked_text mutableString] setString:@""];
+   _view->composition({});
+}
+
+- (void) set_text_caret : (NSRect) caret
+{
+   _text_caret = caret;
 }
 
 - (NSArray*) validAttributesForMarkedText
@@ -521,10 +1164,15 @@ namespace
 - (NSRect) firstRectForCharacterRange : (NSRange)range
                           actualRange : (NSRangePointer)actualRange
 {
-   int xpos, ypos;
-   get_window_pos([self window], xpos, ypos);
-   NSRect const content_rect = [[self window] frame];
-   return NSMakeRect(xpos, transformY(ypos + content_rect.size.height), 0.0, 0.0);
+   if (NSIsEmptyRect(_text_caret))
+   {
+      int xpos, ypos;
+      get_window_pos([self window], xpos, ypos);
+      NSRect const content_rect = [[self window] frame];
+      return NSMakeRect(xpos, transformY(ypos + content_rect.size.height), 0.0, 0.0);
+   }
+   NSRect const in_window = [self convertRect : _text_caret toView : nil];
+   return [[self window] convertRectToScreen : in_window];
 }
 
 - (void) insertText : (id)string replacementRange : (NSRange)replacementRange
@@ -534,13 +1182,19 @@ namespace
    auto*       characters = ([string isKindOfClass:[NSAttributedString class]]) ?
                  [string string] : (NSString*) string;
 
+   if ([self hasMarkedText])
+   {
+      [[_marked_text mutableString] setString:@""];
+      _view->composition({});
+   }
+
    NSUInteger i, length = [characters length];
    for (i = 0;  i < length;  i++)
    {
       const unichar codepoint = [characters characterAtIndex:i];
       if ((codepoint & 0xff00) == 0xf700)
          continue;
-      _text_inserted = handle_text(*_view, { codepoint, mods });
+      _text_inserted = handle_text(*_view, {codepoint, mods});
    }
 }
 
@@ -550,17 +1204,162 @@ namespace
 
 -(void) windowDidBecomeKey : (NSNotification*) notification
 {
-   _view->begin_focus();
+   if (_view)
+      _view->begin_focus();
 }
 
 -(void) windowDidResignKey : (NSNotification*) notification
 {
-   _view->end_focus();
+   if (_view)
+      _view->end_focus();
 }
+
+-(void) windowWillClose : (NSNotification*) notification
+{
+   if (_view)
+      _view->on_close();
+}
+
+#if defined(ARTIST_SKIA)
+// Workaround SKIA flickering when the window is moved to a different screen in MacOS
+
+-(void) windowDidMove : (NSNotification*) notification
+{
+   // Check if the current screen is different from the last known screen
+   if (![self.window.screen isEqual : _last_screen])
+   {
+      _last_screen = self.window.screen;
+
+      NSRect newFrame = self.frame;
+      newFrame.size.width += 1;
+      newFrame.size.height += 1;
+      [self setFrame:newFrame];
+   }
+}
+
+#endif
+
+// While the drag hovers, the drop names the types on offer, with no data;
+// the data is read on the drop.
+-(void) makeDropInfo : (id <NSDraggingInfo>) sender : (ph::drop_info*) info : (bool) with_data
+{
+   auto pos = [sender draggingLocation];
+   pos = [self convertPoint : pos fromView : nil];
+   info->where = ph::point{float(pos.x), float(pos.y)};
+
+   // The MIME types on offer that the view takes drops of.
+   NSPasteboard* pasteboard = [sender draggingPasteboard];
+   std::vector<std::string> types;
+   if (auto const& accepted = _view->accepted_drop_types())
+   {
+      for (auto const& mime : *accepted)
+      {
+         if (pasteboard_has(pasteboard, mime))
+            types.push_back(mime);
+      }
+   }
+   else
+   {
+      types = pasteboard_mime_types(pasteboard);
+   }
+   if (with_data)
+   {
+      info->data = read_pasteboard(pasteboard, ph::mime_types(types.begin(), types.end()));
+   }
+   else
+   {
+      for (auto const& type : types)
+         info->data[type] = std::string{};
+   }
+}
+
+- (BOOL) performDragOperation : (id <NSDraggingInfo>) sender
+{
+   ph::drop_info info;
+   [self makeDropInfo : sender : &info : true];
+   if (info.data.size())
+   {
+      if (_view->drop(info))
+         return YES;
+   }
+   return NO;
+}
+
+- (BOOL) wantsPeriodicDraggingUpdates
+{
+   return YES;
+}
+
+- (NSDragOperation) draggingEntered : (id <NSDraggingInfo>) sender
+{
+   ph::drop_info info;
+   [self makeDropInfo : sender : &info : false];
+   if (info.data.size())
+      _view->track_drop(info, ph::cursor_tracking::entering);
+   return NSDragOperationGeneric;
+}
+
+- (NSDragOperation) draggingUpdated : (id<NSDraggingInfo>) sender
+{
+   ph::drop_info info;
+   [self makeDropInfo : sender : &info : false];
+   if (info.data.size())
+      _view->track_drop(info, ph::cursor_tracking::hovering);
+   return NSDragOperationGeneric;
+}
+
+- (void) draggingExited : (id <NSDraggingInfo>) sender
+{
+   ph::drop_info info;
+   [self makeDropInfo : sender : &info : false];
+   if (info.data.size())
+      _view->track_drop(info, ph::cursor_tracking::leaving);
+}
+
+#if !defined(ARTIST_SKIA)
+// A benchmark frame for Quartz 2D and Cairo. AppKit records drawRect: drawing
+// and rasterizes it later, outside any time the view can take. So the view's
+// own drawing is rasterized into a bitmap now, which is the draw and flush
+// time, and the bitmap is presented after the timer stops. The bitmap is 1x,
+// so the pixel count matches a scale-1 display on the other machines.
+- (void) perf_frame
+{
+   auto const bounds = self.bounds;
+   if (!_perf_rep || _perf_rep.size.width != bounds.size.width
+      || _perf_rep.size.height != bounds.size.height)
+      _perf_rep = [[NSBitmapImageRep alloc]
+         initWithBitmapDataPlanes : nullptr
+                       pixelsWide : NSInteger(bounds.size.width)
+                       pixelsHigh : NSInteger(bounds.size.height)
+                    bitsPerSample : 8
+                  samplesPerPixel : 4
+                         hasAlpha : YES
+                         isPlanar : NO
+                   colorSpaceName : NSDeviceRGBColorSpace
+                      bytesPerRow : 0
+                     bitsPerPixel : 0
+      ];
+
+   auto t0 = std::chrono::steady_clock::now();
+   [self cacheDisplayInRect : bounds toBitmapImageRep : _perf_rep];
+   double ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - t0).count();
+
+   self.wantsLayer = YES;
+   [CATransaction begin];
+   [CATransaction setDisableActions : YES];
+   self.layer.contents = (__bridge id) _perf_rep.CGImage;
+   [CATransaction commit];
+   [CATransaction flush];
+
+   cycfi::elements::perf::set_pixel_size(int(_perf_rep.pixelsWide), int(_perf_rep.pixelsHigh));
+   cycfi::elements::perf::record(ms);
+}
+#endif
 
 @end // @implementation ElementsView
 
-namespace cycfi { namespace elements
+namespace cycfi::elements
 {
    namespace
    {
@@ -583,12 +1382,12 @@ namespace cycfi { namespace elements
 
    base_view::base_view(host_window_handle h)
    {
+      NSWindow* window_ = (__bridge NSWindow*) h;
       ElementsView* content = [[ElementsView alloc] init];
       _view = (__bridge host_view_handle) content;
       content.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
       [content elements_init : this];
 
-      NSWindow* window_ = (__bridge NSWindow*) h;
       [window_ setContentView : content];
       [get_mac_view(host()) attach_notifications];
    }
@@ -612,15 +1411,11 @@ namespace cycfi { namespace elements
    base_view::~base_view()
    {
       auto ns_view = get_mac_view(host());
+      [ns_view elements_detach];
       [ns_view detach_notifications];
       [ns_view detach_timer];
       [ns_view removeFromSuperview];
       _view = nil;
-   }
-
-   float base_view::hdpi_scale() const
-   {
-      return 1.0f; // This is already done properly by the cocoa->cairo context
    }
 
    point base_view::cursor_pos() const
@@ -628,22 +1423,29 @@ namespace cycfi { namespace elements
       auto  ns_view = get_mac_view(host());
       auto  pos = [[ns_view window] mouseLocationOutsideOfEventStream];
       pos = [ns_view convertPoint : pos fromView : nil];
-      return { float(pos.x), float(pos.y) };
+      return {float(pos.x), float(pos.y)};
    }
 
    extent base_view::size() const
    {
       auto frame = [get_mac_view(host()) frame];
-      return { float(frame.size.width), float(frame.size.height) };
+      return {float(frame.size.width), float(frame.size.height)};
    }
 
    void base_view::size(elements::extent size_)
    {
-      [get_mac_view(host()) setFrameSize : NSSize{ size_.x, size_.y }];
+      [get_mac_view(host()) setFrameSize : NSSize{size_.x, size_.y}];
    }
 
    void base_view::refresh()
    {
+#if !defined(ARTIST_SKIA)
+      if (perf::enabled())
+      {
+         [get_mac_view(host()) perf_frame];
+         return;
+      }
+#endif
       [get_mac_view(host()) setNeedsDisplay : YES];
    }
 
@@ -654,26 +1456,41 @@ namespace cycfi { namespace elements
       ];
    }
 
-   std::string clipboard()
+   void base_view::accept_drop_types(mime_types const& types)
    {
-      NSPasteboard* pasteboard = [NSPasteboard generalPasteboard];
-      if (![[pasteboard types] containsObject:NSPasteboardTypeString])
-         return {};
-
-      NSString* object = [pasteboard stringForType:NSPasteboardTypeString];
-      if (!object)
-         return {};
-      return [object UTF8String];
+      _drop_types = types;
+      auto ns_view = get_mac_view(host());
+      [ns_view unregisterDraggedTypes];
+      [ns_view registerForDraggedTypes : drop_types(_drop_types)];
    }
 
-   void clipboard(std::string const& text)
+   void base_view::text_caret(rect bounds)
    {
-      NSArray* types = [NSArray arrayWithObjects:NSPasteboardTypeString, nil];
+      [get_mac_view(host()) set_text_caret
+         : NSMakeRect(bounds.left, bounds.top, bounds.width(), bounds.height())
+      ];
+   }
 
-      NSPasteboard* pasteboard = [NSPasteboard generalPasteboard];
-      [pasteboard declareTypes:types owner:nil];
-      [pasteboard setString:[NSString stringWithUTF8String:text.c_str()]
-                    forType:NSPasteboardTypeString];
+   // Types of the pasteboard's own making, a custom MIME type's, are not
+   // listed here: clipboard_contains finds them.
+   std::vector<std::string> clipboard_types()
+   {
+      return pasteboard_mime_types([NSPasteboard generalPasteboard]);
+   }
+
+   bool clipboard_contains(std::string_view mime_type)
+   {
+      return pasteboard_has([NSPasteboard generalPasteboard], std::string{mime_type});
+   }
+
+   payload get_clipboard(mime_types const& types)
+   {
+      return read_pasteboard([NSPasteboard generalPasteboard], types);
+   }
+
+   void set_clipboard(payload const& data)
+   {
+      write_pasteboard([NSPasteboard generalPasteboard], data);
    }
 
    void set_cursor(cursor_type type)
@@ -704,7 +1521,6 @@ namespace cycfi { namespace elements
    point scroll_direction()
    {
       float dir = [[[NSUserDefaults standardUserDefaults] objectForKey:@"com.apple.swipescrolldirection"] boolValue]? +1.0f : -1.0f;
-      return { dir, dir };
+      return {dir, dir};
    }
-}}
-
+}

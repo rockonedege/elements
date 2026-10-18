@@ -1,17 +1,17 @@
 /*=============================================================================
-   Copyright (c) 2016-2020 Joel de Guzman
+   Copyright (c) 2016-2023 Joel de Guzman
 
    Distributed under the MIT License [ https://opensource.org/licenses/MIT ]
 =============================================================================*/
 #include <elements/element/floating.hpp>
 #include <elements/support/context.hpp>
 
-namespace cycfi { namespace elements
+namespace cycfi::elements
 {
    view_limits floating_element::limits(basic_context const& ctx) const
    {
       auto e_limits = this->subject().limits(ctx);
-      return { { e_limits.min.x, e_limits.min.y }, { full_extent, full_extent } };
+      return {{e_limits.min.x, e_limits.min.y}, {full_extent, full_extent}};
    }
 
    void floating_element::prepare_subject(context& ctx)
@@ -31,7 +31,12 @@ namespace cycfi { namespace elements
       else if (h > e_limits.max.y)
          ctx.bounds.height(e_limits.max.y);
 
-      ctx.bounds = center(ctx.bounds, this->bounds());
+      // Kept at its top left: the bounds' size gives way to the limits.
       this->bounds(ctx.bounds);
    }
-}}
+
+   std::string floating_element::class_name() const
+   {
+      return "floating";
+   }
+}

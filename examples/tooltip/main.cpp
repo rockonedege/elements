@@ -1,5 +1,5 @@
 /*=============================================================================
-   Copyright (c) 2016-2020 Joel de Guzman
+   Copyright (c) 2016-2023 Joel de Guzman
 
    Distributed under the MIT License (https://opensource.org/licenses/MIT)
 =============================================================================*/
@@ -8,6 +8,7 @@
 #include <random>
 
 using namespace cycfi::elements;
+using namespace cycfi::artist;
 
 // Main window background color
 auto constexpr bkd_color = rgba(35, 35, 37, 255);
@@ -20,19 +21,17 @@ constexpr auto pgold    = colors::gold.opacity(0.8);
 
 auto make_tip(std::string text)
 {
-   return layer(
-      margin({ 20, 8, 20, 8 }, label(text))
-    , panel{}
-   );
+   return tooltip_bubble(std::move(text));
 }
 
 template <typename Label>
 auto make_button(std::string text, color c, Label label, view& view_)
 {
    static int i = 1;
+   std::string orig{label->get_text().data(), label->get_text().size()};
    auto tt = tooltip(toggle_button("Option " + std::to_string(i++), 1.0f, c), make_tip(text));
    tt.on_hover =
-      [label, text, &view_, orig = label->get_text()](bool visible)
+      [label, text, &view_, orig](bool visible)
       {
          label->set_text(visible? text : orig);
          view_.refresh(*label.get(), 3);
@@ -49,20 +48,24 @@ auto make_buttons(view& view_)
    auto button4 = make_button("Four-dimensional superstructures", pgold, status, view_);
 
    return
-      margin({ 50, 20, 50, 40 },
+      margin({50, 20, 50, 40},
          vtile(
-            align_center(top_margin(20, hold(status))),
-            top_margin(20, button1),
-            top_margin(20, button2),
-            top_margin(20, button3),
-            top_margin(20, button4)
+            align_center(margin_top(20, hold(status))),
+            margin_top(20, button1),
+            margin_top(20, button2),
+            margin_top(20, button3),
+            margin_top(20, button4)
          )
       );
 }
 
 int main(int argc, char* argv[])
 {
-   app _app(argc, argv, "Tooltip", "com.cycfi.tooltip");
+   app _app("Tooltip");
+
+   // Set up the fonts and search paths once, at startup, so the
+   // first window does not pay for it.
+   init_resources();
    window _win(_app.name());
    _win.on_close = [&_app]() { _app.stop(); };
 

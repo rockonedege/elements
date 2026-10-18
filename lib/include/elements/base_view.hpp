@@ -1,5 +1,5 @@
 /*=============================================================================
-   Copyright (c) 2016-2020 Joel de Guzman. All rights reserved.
+   Copyright (c) 2016-2023 Joel de Guzman. All rights reserved.
 
    Distributed under the MIT License [ https://opensource.org/licenses/MIT ]
 =============================================================================*/
@@ -9,20 +9,30 @@
 #include <utility>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <vector>
 #include <cstdint>
 #include <functional>
-#include <cairo.h>
+#include <optional>
 
 #include <infra/support.hpp>
-#include <elements/support/point.hpp>
-#include <elements/support/rect.hpp>
+#include <artist/point.hpp>
+#include <artist/rect.hpp>
+#include <artist/canvas.hpp>
+#include <infra/filesystem.hpp>
+#include <elements/support/payload.hpp>
 
 #if defined(ELEMENTS_HOST_UI_LIBRARY_WIN32)
 # include <windows.h>
 #endif
 
-namespace cycfi { namespace elements
+namespace cycfi::elements
 {
+   using artist::canvas;
+   using artist::point;
+   using artist::rect;
+   using artist::extent;
+
    ////////////////////////////////////////////////////////////////////////////
    // Mouse Button
    ////////////////////////////////////////////////////////////////////////////
@@ -54,22 +64,27 @@ namespace cycfi { namespace elements
 
    struct view_limits
    {
-      point    min = { 0.0, 0.0 };
-      point    max = { full_extent, full_extent };
+      point    min = {0.0, 0.0};
+      point    max = {full_extent, full_extent};
    };
 
    constexpr view_limits full_limits = {
-      { 0.0, 0.0 }
-    , { full_extent, full_extent }
+      {0.0, 0.0}
+    , {full_extent, full_extent}
    };
 
    ////////////////////////////////////////////////////////////////////////////
    // View stretch
    ////////////////////////////////////////////////////////////////////////////
+   using artist::axis;
+
    struct view_stretch
    {
       float    x = 1.0;
       float    y = 1.0;
+
+      constexpr float&  operator[](axis a);
+      constexpr float   operator[](axis a) const;
    };
 
    ////////////////////////////////////////////////////////////////////////////
@@ -79,6 +94,17 @@ namespace cycfi { namespace elements
    {
       uint32_t codepoint;
       int      modifiers;
+   };
+
+   ////////////////////////////////////////////////////////////////////////////
+   // Composition info: the text an input method is composing, before it
+   // is committed as text, and the cursor's place in it, in characters.
+   // Empty text ends the composition.
+   ////////////////////////////////////////////////////////////////////////////
+   struct composition_info
+   {
+      std::u32string text;
+      std::size_t    cursor = 0;
    };
 
    ////////////////////////////////////////////////////////////////////////////
@@ -274,74 +300,179 @@ namespace cycfi { namespace elements
       int               modifiers;
    };
 
+   /**
+    * \struct drop_info
+    *
+    * \brief
+    *    A structure encapsulating information about a drag-and-drop
+    *    operation.
+    *
+    *    The `drop_info` structure contains information about a drop
+    *    operation, including the payload data and the drop location.
+    *
+    * \var payload data
+    *    The payload that is being transferred during the drag-and-drop
+    *    operation (see payload for more info).
+    *
+    * \var mutable point where
+    *    The location where the drop operation takes place.
+    */
+   struct drop_info
+   {
+      payload           data;
+      mutable point     where;
+   };
+
    ////////////////////////////////////////////////////////////////////////////
    // The base view base class
    ////////////////////////////////////////////////////////////////////////////
 
-#if defined(ELEMENTS_HOST_UI_LIBRARY_COCOA) || defined(ELEMENTS_HOST_UI_LIBRARY_GTK)
+#if defined(ELEMENTS_HOST_UI_LIBRARY_WIN32)
+   using host_view_handle = HWND;
+   using host_window_handle = HWND;
+#else
    struct host_view;
    using host_view_handle = host_view*;
    struct host_window;
    using host_window_handle = host_window*;
-#elif defined(ELEMENTS_HOST_UI_LIBRARY_WIN32)
-   using host_view_handle = HWND;
-   using host_window_handle = HWND;
-#else
-   #error no ELEMENTS_HOST_UI_LIBRARY_* set
 #endif
 
    class base_view : non_copyable
    {
    public:
 
-#if defined(ELEMENTS_HOST_UI_LIBRARY_COCOA) || defined(ELEMENTS_HOST_UI_LIBRARY_GTK)
+#if defined(ELEMENTS_HOST_UI_LIBRARY_COCOA) || defined(ELEMENTS_HOST_UI_LIBRARY_GTK) \
+    || defined(ELEMENTS_HOST_UI_LIBRARY_X11) || defined(ELEMENTS_HOST_UI_LIBRARY_WAYLAND) \
+    || defined(ELEMENTS_HOST_UI_LIBRARY_HEADLESS)
                            base_view(host_view_handle h);
+#endif
+#if defined(ELEMENTS_HOST_UI_LIBRARY_X11)
+                           // A view inside a window someone else owns. The
+                           // parent is an X11 Window, spelled as its
+                           // underlying type to keep Xlib out of this header.
+                           base_view(unsigned long parent);
 #endif
                            base_view(extent size_);
                            base_view(host_window_handle h);
       virtual              ~base_view();
 
-      virtual void         draw(cairo_t* ctx, rect area);
+      virtual void         draw(canvas& cnv);
       virtual void         click(mouse_button btn);
       virtual void         drag(mouse_button btn);
       virtual void         cursor(point p, cursor_tracking status);
       virtual void         scroll(point dir, point p);
       virtual bool         key(key_info const& k);
       virtual bool         text(text_info const& info);
+      virtual void         composition(composition_info const& info);
       virtual void         begin_focus();
       virtual void         end_focus();
+      virtual void         track_drop(drop_info const& info, cursor_tracking status);
+      virtual bool         drop(drop_info const& info);
       virtual void         poll();
 
       virtual void         refresh();
       virtual void         refresh(rect area);
 
-      float                hdpi_scale() const;
+      virtual void         on_open(extent size_, float scale);
+      virtual void         on_size_change(extent size_);
+      virtual void         on_scale_change(float scale);
+      virtual void         on_close();
+
       point                cursor_pos() const;
       extent               size() const;
       void                 size(extent size_);
       host_view_handle     host() const { return _view; }
 
+      // The MIME types the view takes drops of. The host takes a drag only
+      // if it offers one of them, and reads only those on the drop. Until
+      // it is told, a view takes drops of any type; elements' view tells it
+      // the types its content takes (see element::drop_types).
+      void                 accept_drop_types(mime_types const& types);
+      std::optional<mime_types> const&
+                           accepted_drop_types() const { return _drop_types; }
+
+      // Where the text caret is, in view coordinates. A text box being
+      // edited tells the host, so the input method's composition and
+      // candidate windows can sit at the caret.
+      void                 text_caret(rect bounds);
+
    private:
 
       host_view_handle     _view;
+      std::optional<mime_types> _drop_types;
    };
 
    ////////////////////////////////////////////////////////////////////////////
-   inline void base_view::draw(cairo_t* /* ctx */, rect /* area */) {}
+   inline void base_view::draw(canvas& /* ctx */) {}
    inline void base_view::click(mouse_button /* btn */) {}
    inline void base_view::drag(mouse_button /* btn */) {}
    inline void base_view::cursor(point /* p */, cursor_tracking /* status */) {}
    inline void base_view::scroll(point /* dir */, point /* p */) {}
    inline bool base_view::key(key_info const& /* k */) { return false; }
    inline bool base_view::text(text_info const& /* info */) { return false; }
+   inline void base_view::composition(composition_info const& /* info */) {}
    inline void base_view::begin_focus() {}
    inline void base_view::end_focus() {}
+   inline void base_view::track_drop(drop_info const& /*info*/, cursor_tracking /* status */) {}
+   inline bool base_view::drop(drop_info const& /*info*/)
+   {
+      return false;
+   }
    inline void base_view::poll() {}
+   inline void base_view::on_open(extent /* size_ */, float /* scale */) {}
+   inline void base_view::on_size_change(extent /* size_ */) {}
+   inline void base_view::on_scale_change(float /* scale */) {}
+   inline void base_view::on_close() {}
+
+   ////////////////////////////////////////////////////////////////////////////
+   // Set up the resources a view needs: the search path its images are
+   // found on, and the fonts it draws with, registered with the system.
+   // Done once per process, on the first view if nothing does it sooner.
+   //
+   // Registering a font is a round trip to the system's font service, and
+   // in some hosts a slow one: a plugin that calls this when it is loaded
+   // pays it there rather than when its window opens, which is the moment
+   // someone is waiting. Idempotent, and safe to call more than once.
+   void init_resources();
 
    ////////////////////////////////////////////////////////////////////////////
    // The clipboard
-   std::string clipboard();
-   void clipboard(std::string const& text);
+   //
+   // The clipboard holds a payload, the same as a drop does: one entry per
+   // format, keyed by MIME type. Copy puts every format the data has on the
+   // clipboard; paste asks for the formats it can use and gets the ones
+   // that are there. The common types are "text/plain" (UTF-8 text),
+   // "text/uri-list" (files, as file:// URIs), "text/html" and "image/png";
+   // each host maps them to and from its own formats. Any other MIME type
+   // is passed through as is, for data exchanged between applications that
+   // know it.
+   ////////////////////////////////////////////////////////////////////////////
+
+   // The MIME types the clipboard holds now. No data is fetched.
+   std::vector<std::string> clipboard_types();
+
+   // Whether the clipboard holds data of the MIME type. No data is fetched.
+   bool clipboard_contains(std::string_view mime_type);
+
+   // The data of each of the MIME types the clipboard holds now. Types the
+   // clipboard does not hold are left out: an empty payload means there is
+   // nothing there that the caller can use.
+   payload get_clipboard(mime_types const& types);
+
+   // Replace what the clipboard holds with the payload, every entry in it.
+   void set_clipboard(payload const& data);
+
+   [[deprecated("Use get_plain_text(get_clipboard({\"text/plain\"})) instead.")]]
+   inline std::string clipboard()
+   {
+      return get_plain_text(get_clipboard({"text/plain"}));
+   }
+
+   [[deprecated("Use set_clipboard({{\"text/plain\", text}}) instead.")]]
+   inline void clipboard(std::string_view text)
+   {
+      set_clipboard({{"text/plain", std::string{text}}});
+   }
 
    ////////////////////////////////////////////////////////////////////////////
    // The Cursor
@@ -360,6 +491,17 @@ namespace cycfi { namespace elements
    ////////////////////////////////////////////////////////////////////////////
    // Scroll direction
    point scroll_direction();
-}}
+
+   ////////////////////////////////////////////////////////////////////////////
+   constexpr float& view_stretch::operator[](axis a)
+   {
+      return a==axis::x ? x : y;
+   }
+
+   constexpr float view_stretch::operator[](axis a) const
+   {
+     return a==axis::x ? x : y;
+   }
+}
 
 #endif

@@ -1,0 +1,1696 @@
+/*=============================================================================
+   Copyright (c) 2016-2023 Joel de Guzman
+
+   Distributed under the MIT License (https://opensource.org/licenses/MIT)
+=============================================================================*/
+#include <elements/base_view.hpp>
+#include <elements/window.hpp>
+#include <infra/assert.hpp>
+#include <artist/resources.hpp>
+#include <artist/canvas.hpp>
+#include <elements/support/perf.hpp>
+#include "wayland_host.hpp"
+#include "../common/transfer.hpp"
+#include "../common/scroll_direction.hpp"
+
+#include <wayland-client.h>
+#include <libdecor.h>
+#include <xkbcommon/xkbcommon.h>
+#include <xkbcommon/xkbcommon-compose.h>
+#include <infra/utf8_utils.hpp>
+#include "text-input-unstable-v3-client-protocol.h"
+#include <wayland-cursor.h>
+#include <linux/input-event-codes.h>
+
+#if defined(ARTIST_SKIA)
+# include <wayland-egl.h>
+# include <EGL/egl.h>
+# include <GL/gl.h>
+# include <SkImage.h>
+# include <SkColorSpace.h>
+# include <SkCanvas.h>
+# include <SkSurface.h>
+# include <ganesh/GrDirectContext.h>
+# include <ganesh/GrBackendSurface.h>
+# include <ganesh/SkSurfaceGanesh.h>
+# include <ganesh/gl/GrGLInterface.h>
+# include <ganesh/gl/GrGLDirectContext.h>
+# include <ganesh/gl/GrGLBackendSurface.h>
+# include <ganesh/gl/GrGLTypes.h>
+# include <ganesh/gl/egl/GrGLMakeEGLInterface.h>
+# include <vector>
+#elif defined(ARTIST_CAIRO)
+# include <cairo.h>
+#endif
+
+#include <sys/mman.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
+#include <limits.h>
+#include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <cmath>
+#include <chrono>
+#include <initializer_list>
+#include <map>
+#include <set>
+#include <algorithm>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <optional>
+#include <vector>
+#include <stdexcept>
+
+namespace cycfi::artist
+{
+   namespace
+   {
+      fs::path exe_path()
+      {
+         char result[PATH_MAX];
+         ssize_t count = readlink("/proc/self/exe", result, PATH_MAX);
+         return std::string(result, (count > 0)? count : 0);
+      }
+
+      fs::path find_resources()
+      {
+         fs::path const app_dir = exe_path().parent_path();
+         if (app_dir.filename() == "bin")
+         {
+            fs::path const p = app_dir.parent_path() / "share" / exe_path().filename() / "resources";
+            if (fs::is_directory(p)) return p;
+         }
+         fs::path const r = app_dir / "resources";
+         if (fs::is_directory(r)) return r;
+         return fs::current_path() / "resources";
+      }
+   }
+
+   void init_paths() { add_search_path(find_resources()); }
+   fs::path get_user_fonts_directory() { return find_resources(); }
+}
+
+namespace cycfi::elements
+{
+   // Defined in window.cpp
+   wl_surface*     get_surface(host_window& h);
+   libdecor_frame* get_frame(host_window& h);
+
+   // Defined in key.cpp
+   key_code translate_key(unsigned keysym);
+
+   ////////////////////////////////////////////////////////////////////////////
+   struct host_view;
+
+#if defined(ARTIST_CAIRO)
+   // One double-buffered shm buffer (software render path).
+   struct shm_buffer
+   {
+      wl_buffer*        buffer = nullptr;
+      wl_shm_pool*      pool = nullptr;
+      void*             data = nullptr;
+      int               fd = -1;
+      size_t            size = 0;
+      cairo_surface_t*  cairo = nullptr;
+      host_view*        owner = nullptr;
+      bool              busy = false;          // attached, compositor may be using it
+      rect              damage;                // logical area it is behind by
+      bool              has_damage = false;
+      bool              stale = true;          // behind everywhere (new buffer)
+   };
+#endif
+
+   struct host_view
+   {
+      wl_surface*       surface = nullptr;
+      libdecor_frame*   frame = nullptr;
+      double            scale = 1.0;          // fractional scale
+      point             size;                 // logical size
+      point             cursor_position;
+      base_view*        self = nullptr;       // back-pointer (for deferred render)
+      bool              configured = false;
+      bool              pending = false;       // a render is due: asked for, or deferred
+
+      // Integer per-monitor HiDPI: the outputs the surface is on; scale = the
+      // max of their wl_output scales (set via wl_surface_set_buffer_scale).
+      std::set<wl_output*> outputs;
+
+#if defined(ARTIST_CAIRO)
+      shm_buffer        bufs[2];               // double-buffered shm
+#elif defined(ARTIST_SKIA)
+      // EGL swap-chain render path: a wl_egl_window backing an EGL window
+      // surface, drawn by Skia's Ganesh GL backend.
+      wl_egl_window*    egl_window = nullptr;
+      EGLDisplay        egl_display = EGL_NO_DISPLAY;
+      EGLContext        egl_context = EGL_NO_CONTEXT;
+      EGLSurface        egl_surface = EGL_NO_SURFACE;
+      sk_sp<const GrGLInterface> xface;
+      sk_sp<GrDirectContext>     ctx;
+      sk_sp<SkSurface>           skia_surface;
+      int               pix_w = 0, pix_h = 0;
+
+      // Frame-callback throttle: render at most once per compositor frame.
+      // A refresh while a frame is in flight sets needs_render, which the
+      // frame-done callback consumes, coalescing bursts into one render.
+      wl_callback*      frame_cb = nullptr;
+      bool              frame_pending = false;
+      bool              needs_render = false;
+#endif
+      std::unique_ptr<drop_info> _drop_info;
+   };
+
+   struct platform_access
+   {
+      inline static host_view* get_host_view(base_view& v) { return v.host(); }
+   };
+
+   ////////////////////////////////////////////////////////////////////////////
+   // Platform (lazy singleton)
+   ////////////////////////////////////////////////////////////////////////////
+   namespace
+   {
+      void registry_global(void*, wl_registry*, uint32_t, const char*, uint32_t);
+      void registry_remove(void*, wl_registry*, uint32_t) {}
+      constexpr wl_registry_listener registry_listener = { registry_global, registry_remove };
+
+      void libdecor_error(libdecor*, libdecor_error, const char* msg)
+      {
+         throw std::runtime_error(std::string("libdecor: ") + msg);
+      }
+      libdecor_interface decor_iface = { libdecor_error };
+
+      struct platform;
+      void init_data_device(platform& p);   // fwd
+      void init_text_input(platform& p);    // fwd
+
+      struct platform
+      {
+         wl_display*    display = nullptr;
+         wl_registry*   registry = nullptr;
+         wl_compositor* compositor = nullptr;
+         wl_shm*        shm = nullptr;
+         libdecor*      decor = nullptr;
+         std::map<wl_output*, int32_t> output_scale;
+
+         // Input (wl_seat + xkbcommon)
+         wl_seat*       seat = nullptr;
+         wl_pointer*    pointer = nullptr;
+         wl_keyboard*   keyboard = nullptr;
+         xkb_context*   xkb_ctx = nullptr;
+         xkb_keymap*    xkb_map = nullptr;
+         xkb_state*     xkb_st = nullptr;
+         xkb_compose_state* compose = nullptr;  // dead keys and compose sequences
+         base_view*     pointer_focus = nullptr;
+         base_view*     keyboard_focus = nullptr;
+
+         // Input methods (text-input-v3): enabled while one of our surfaces
+         // has the text input focus. Its events gather until done.
+         zwp_text_input_manager_v3* text_input_manager = nullptr;
+         zwp_text_input_v3* text_input = nullptr;
+         base_view*     text_input_view = nullptr;
+         std::string    pending_preedit;
+         int32_t        pending_cursor = 0;
+         std::string    pending_commit;
+         rect           text_caret;
+
+         // The cursor: a client sets it each time the pointer enters one of
+         // its surfaces, from the theme, at the surface's scale.
+         uint32_t       pointer_serial = 0;     // of the latest pointer enter
+         cursor_type    cursor = cursor_type::arrow;
+         wl_surface*    cursor_surface = nullptr;
+         std::map<int, wl_cursor_theme*> cursor_themes;
+         point          pointer_pos;
+
+         // Key repeat: the compositor gives the rate and delay, and the
+         // client repeats a held key itself.
+         int32_t        repeat_rate = 25;       // per second; 0 is none
+         int32_t        repeat_delay = 400;     // ms before the first repeat
+         uint32_t       repeat_keycode = 0;     // the held key; 0 is none
+         std::chrono::steady_clock::time_point repeat_next;
+         uint32_t       click_time = 0;
+         int            click_count = 0;
+         uint32_t       last_button = 0;
+         int            down_button = 0;   // 0=none,1=left,2=middle,3=right
+
+         std::map<wl_surface*, base_view*> views;
+
+         // Data transfer: the clipboard (the selection) and drag and drop
+         // both come as a wl_data_offer on the seat's data device.
+         wl_data_device_manager* data_device_manager = nullptr;
+         uint32_t       data_device_manager_version = 0;
+         wl_data_device* data_device = nullptr;
+         uint32_t       input_serial = 0;       // of the latest input event
+         std::map<wl_data_offer*, std::vector<std::string>> offers;  // types on offer
+         wl_data_offer* selection_offer = nullptr;   // the clipboard, if not ours
+         wl_data_source* clip_source = nullptr;      // the clipboard, if ours
+         payload        clip_data;                   // what clip_source offers
+         wl_data_offer* dnd_offer = nullptr;
+         base_view*     dnd_view = nullptr;
+
+         // Ctor does NO roundtrips — just connect + registry + xkb context, so
+         // no Wayland listener fires before the singleton pointer is set.
+         platform()
+         {
+            display = wl_display_connect(nullptr);
+            if (!display)
+               throw std::runtime_error("Failed to connect to Wayland display");
+            xkb_ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+            registry = wl_display_get_registry(display);
+            wl_registry_add_listener(registry, &registry_listener, this);
+         }
+
+         // Roundtrips happen here, AFTER the singleton pointer is assigned, so
+         // listeners (seat_caps, kb_keymap, ...) calling plat() see a valid
+         // pointer instead of re-entering a still-initializing function-local
+         // static (which would throw recursive_init_error).
+         void init()
+         {
+            wl_display_roundtrip(display);   // receive globals
+            if (!compositor || !shm)
+               throw std::runtime_error("Missing required Wayland globals");
+            init_data_device(*this);
+            init_text_input(*this);
+            wl_display_roundtrip(display);   // receive seat capabilities + keymap
+            decor = libdecor_new(display, &decor_iface);
+         }
+      };
+
+      platform* g_platform = nullptr;
+      platform& plat()
+      {
+         if (!g_platform)
+         {
+            g_platform = new platform();   // pointer set BEFORE init() roundtrips
+            g_platform->init();
+         }
+         return *g_platform;
+      }
+
+      ////////////////////////////////////////////////////////////////////////
+      // Input (wl_seat: pointer + keyboard via xkbcommon)
+      ////////////////////////////////////////////////////////////////////////
+      int get_mods()
+      {
+         auto& p = plat();
+         if (!p.xkb_st)
+            return 0;
+         int m = 0;
+         auto on = [&](const char* n)
+            { return xkb_state_mod_name_is_active(p.xkb_st, n, XKB_STATE_MODS_EFFECTIVE) > 0; };
+         if (on(XKB_MOD_NAME_SHIFT)) m |= mod_shift;
+         if (on(XKB_MOD_NAME_CTRL))  m |= mod_control | mod_action;
+         if (on(XKB_MOD_NAME_ALT))   m |= mod_alt;
+         if (on(XKB_MOD_NAME_LOGO))  m |= mod_super;
+         return m;
+      }
+
+      // The theme's names for a cursor, the CSS name first, then the older
+      // X11 one.
+      std::initializer_list<char const*> cursor_names(cursor_type type)
+      {
+         switch (type)
+         {
+            case cursor_type::ibeam:      return {"text", "xterm"};
+            case cursor_type::cross_hair: return {"crosshair", "cross"};
+            case cursor_type::hand:       return {"pointer", "hand2"};
+            case cursor_type::h_resize:   return {"ew-resize", "sb_h_double_arrow"};
+            case cursor_type::v_resize:   return {"ns-resize", "sb_v_double_arrow"};
+            default:                      return {"default", "left_ptr"};
+         }
+      }
+
+      // Shows the current cursor over the surface the pointer is in.
+      void apply_cursor()
+      {
+         auto& p = plat();
+         if (!p.pointer || !p.pointer_focus || !p.shm || !p.compositor)
+            return;
+         int const scale = std::max(1, int(std::lround(
+            platform_access::get_host_view(*p.pointer_focus)->scale)));
+
+         auto& theme = p.cursor_themes[scale];
+         if (!theme)
+         {
+            int size = 24;
+            if (char const* s = std::getenv("XCURSOR_SIZE"))
+               size = std::max(1, std::atoi(s));
+            theme = wl_cursor_theme_load(std::getenv("XCURSOR_THEME"), size * scale, p.shm);
+            if (!theme)
+               return;
+         }
+
+         wl_cursor* c = nullptr;
+         for (auto name : cursor_names(p.cursor))
+            if ((c = wl_cursor_theme_get_cursor(theme, name)))
+               break;
+         if (!c || c->image_count == 0)
+            return;
+         wl_cursor_image* img = c->images[0];
+         wl_buffer* buffer = wl_cursor_image_get_buffer(img);
+         if (!buffer)
+            return;
+
+         if (!p.cursor_surface)
+            p.cursor_surface = wl_compositor_create_surface(p.compositor);
+         wl_surface_set_buffer_scale(p.cursor_surface, scale);
+         wl_surface_attach(p.cursor_surface, buffer, 0, 0);
+         wl_surface_damage(p.cursor_surface, 0, 0, int(img->width), int(img->height));
+         wl_surface_commit(p.cursor_surface);
+         wl_pointer_set_cursor(p.pointer, p.pointer_serial, p.cursor_surface,
+            int(img->hotspot_x) / scale, int(img->hotspot_y) / scale);
+      }
+
+      // --- pointer ---
+      void ptr_enter(void*, wl_pointer*, uint32_t serial, wl_surface* surf, wl_fixed_t x, wl_fixed_t y)
+      {
+         auto& p = plat();
+         auto i = p.views.find(surf);
+         p.pointer_focus = (i != p.views.end()) ? i->second : nullptr;
+         p.pointer_serial = serial;
+         if (p.pointer_focus)
+         {
+            apply_cursor();
+            p.pointer_pos = {float(wl_fixed_to_double(x)), float(wl_fixed_to_double(y))};
+            platform_access::get_host_view(*p.pointer_focus)->cursor_position = p.pointer_pos;
+            p.pointer_focus->cursor(p.pointer_pos, cursor_tracking::entering);
+         }
+      }
+      void ptr_leave(void*, wl_pointer*, uint32_t, wl_surface*)
+      {
+         auto& p = plat();
+         if (p.pointer_focus)
+            p.pointer_focus->cursor(p.pointer_pos, cursor_tracking::leaving);
+         p.pointer_focus = nullptr;
+         p.down_button = 0;
+      }
+      void ptr_motion(void*, wl_pointer*, uint32_t, wl_fixed_t x, wl_fixed_t y)
+      {
+         auto& p = plat();
+         if (!p.pointer_focus)
+            return;
+         p.pointer_pos = {float(wl_fixed_to_double(x)), float(wl_fixed_to_double(y))};
+         platform_access::get_host_view(*p.pointer_focus)->cursor_position = p.pointer_pos;
+         if (p.down_button)
+         {
+            mouse_button btn;
+            btn.down = true;
+            btn.modifiers = get_mods();
+            btn.num_clicks = p.click_count;
+            btn.pos = p.pointer_pos;
+            btn.state = mouse_button::what(p.down_button - 1);  // left=0,middle=1,right=2
+            p.pointer_focus->drag(btn);
+         }
+         else
+         {
+            p.pointer_focus->cursor(p.pointer_pos, cursor_tracking::hovering);
+         }
+      }
+      void ptr_button(void*, wl_pointer*, uint32_t serial, uint32_t time, uint32_t button, uint32_t state)
+      {
+         auto& p = plat();
+         p.input_serial = serial;
+         if (!p.pointer_focus)
+            return;
+         mouse_button::what w;
+         int idx;
+         switch (button)
+         {
+            case BTN_LEFT:   w = mouse_button::left;   idx = 1; break;
+            case BTN_MIDDLE: w = mouse_button::middle; idx = 2; break;
+            case BTN_RIGHT:  w = mouse_button::right;  idx = 3; break;
+            default: return;
+         }
+         mouse_button btn;
+         btn.modifiers = get_mods();
+         btn.pos = p.pointer_pos;
+         btn.state = w;
+         if (state == WL_POINTER_BUTTON_STATE_PRESSED)
+         {
+            btn.down = true;
+            if ((time - p.click_time) < 250 && button == p.last_button)
+               ++p.click_count;
+            else
+               p.click_count = 1;
+            p.click_time = time;
+            p.last_button = button;
+            p.down_button = idx;
+         }
+         else
+         {
+            btn.down = false;
+            p.down_button = 0;
+         }
+         btn.num_clicks = p.click_count;
+         p.pointer_focus->click(btn);
+      }
+      void ptr_axis(void*, wl_pointer*, uint32_t, uint32_t axis, wl_fixed_t value)
+      {
+         auto& p = plat();
+         if (!p.pointer_focus)
+            return;
+         float v = float(wl_fixed_to_double(value));
+         float dx = 0, dy = 0;
+         if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
+            dy = -v * 0.5f;
+         else
+            dx = -v * 0.5f;
+         p.pointer_focus->scroll({dx, dy}, p.pointer_pos);
+      }
+      void ptr_frame(void*, wl_pointer*) {}
+      void ptr_axis_source(void*, wl_pointer*, uint32_t) {}
+      void ptr_axis_stop(void*, wl_pointer*, uint32_t, uint32_t) {}
+      void ptr_axis_discrete(void*, wl_pointer*, uint32_t, int32_t) {}
+      void ptr_axis_value120(void*, wl_pointer*, uint32_t, int32_t) {}
+      void ptr_axis_dir(void*, wl_pointer*, uint32_t, uint32_t) {}
+      constexpr wl_pointer_listener pointer_listener = {
+         ptr_enter, ptr_leave, ptr_motion, ptr_button, ptr_axis, ptr_frame,
+         ptr_axis_source, ptr_axis_stop, ptr_axis_discrete, ptr_axis_value120,
+         ptr_axis_dir
+      };
+
+      // --- keyboard ---
+      void kb_keymap(void*, wl_keyboard*, uint32_t format, int32_t fd, uint32_t size)
+      {
+         auto& p = plat();
+         if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) { close(fd); return; }
+         char* str = static_cast<char*>(mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0));
+         if (str != MAP_FAILED)
+         {
+            if (p.xkb_map) xkb_keymap_unref(p.xkb_map);
+            p.xkb_map = xkb_keymap_new_from_string(
+               p.xkb_ctx, str, XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
+            munmap(str, size);
+            if (p.xkb_st) xkb_state_unref(p.xkb_st);
+            p.xkb_st = p.xkb_map ? xkb_state_new(p.xkb_map) : nullptr;
+         }
+         close(fd);
+
+         // The compose table is the locale's, not the keymap's: made once.
+         if (!p.compose)
+         {
+            char const* locale = std::getenv("LC_ALL");
+            if (!locale || !*locale)
+               locale = std::getenv("LC_CTYPE");
+            if (!locale || !*locale)
+               locale = std::getenv("LANG");
+            if (!locale || !*locale)
+               locale = "C";
+            if (auto* table = xkb_compose_table_new_from_locale(
+                  p.xkb_ctx, locale, XKB_COMPOSE_COMPILE_NO_FLAGS))
+            {
+               p.compose = xkb_compose_state_new(table, XKB_COMPOSE_STATE_NO_FLAGS);
+               xkb_compose_table_unref(table);
+            }
+         }
+      }
+      void kb_enter(void*, wl_keyboard*, uint32_t serial, wl_surface* surf, wl_array*)
+      {
+         auto& p = plat();
+         p.input_serial = serial;
+         auto i = p.views.find(surf);
+         p.keyboard_focus = (i != p.views.end()) ? i->second : nullptr;
+         if (p.keyboard_focus)
+            p.keyboard_focus->begin_focus();
+      }
+      void kb_leave(void*, wl_keyboard*, uint32_t, wl_surface*)
+      {
+         auto& p = plat();
+         if (p.keyboard_focus)
+            p.keyboard_focus->end_focus();
+         p.keyboard_focus = nullptr;
+         p.repeat_keycode = 0;
+      }
+      void kb_key(void*, wl_keyboard*, uint32_t serial, uint32_t, uint32_t key, uint32_t state)
+      {
+         auto& p = plat();
+         p.input_serial = serial;
+         if (!p.keyboard_focus || !p.xkb_st)
+            return;
+         uint32_t keycode = key + 8;   // evdev → xkb
+
+         // The key is the one without Shift, as on the other hosts: the
+         // first level of the key in the active layout. The text below is
+         // the shifted one.
+         xkb_keysym_t sym = XKB_KEY_NoSymbol;
+         xkb_layout_index_t const layout = xkb_state_key_get_layout(p.xkb_st, keycode);
+         xkb_keysym_t const* syms = nullptr;
+         if (layout != XKB_LAYOUT_INVALID
+            && xkb_keymap_key_get_syms_by_level(p.xkb_map, keycode, layout, 0, &syms) > 0)
+            sym = syms[0];
+         bool pressed = (state == WL_KEYBOARD_KEY_STATE_PRESSED);
+         int mods = get_mods();
+
+         if (auto kc = translate_key(sym); kc != key_code::unknown)
+            p.keyboard_focus->key({kc, pressed ? key_action::press : key_action::release, mods});
+
+         if (pressed)
+         {
+            // A dead key or a compose sequence holds the text back until
+            // the sequence is done, then sends what it composed.
+            uint32_t cp = xkb_state_key_get_utf32(p.xkb_st, keycode);
+            if (p.compose)
+            {
+               xkb_compose_state_feed(p.compose, xkb_state_key_get_one_sym(p.xkb_st, keycode));
+               switch (xkb_compose_state_get_status(p.compose))
+               {
+                  case XKB_COMPOSE_COMPOSING:
+                     cp = 0;
+                     break;
+                  case XKB_COMPOSE_COMPOSED:
+                     cp = xkb_keysym_to_utf32(xkb_compose_state_get_one_sym(p.compose));
+                     xkb_compose_state_reset(p.compose);
+                     break;
+                  case XKB_COMPOSE_CANCELLED:
+                     cp = 0;
+                     xkb_compose_state_reset(p.compose);
+                     break;
+                  default:
+                     break;
+               }
+            }
+            if (cp >= 0x20 && cp != 0x7F)
+               p.keyboard_focus->text({cp, mods});
+            if (p.repeat_rate > 0 && xkb_keymap_key_repeats(p.xkb_map, keycode))
+            {
+               p.repeat_keycode = keycode;
+               p.repeat_next = std::chrono::steady_clock::now()
+                  + std::chrono::milliseconds(p.repeat_delay);
+            }
+         }
+         else if (keycode == p.repeat_keycode)
+         {
+            p.repeat_keycode = 0;
+         }
+      }
+
+      // Sends the held key again when its time comes: as a repeat, and its
+      // text, as the other hosts do.
+      void repeat_key()
+      {
+         auto& p = plat();
+         if (!p.repeat_keycode || !p.keyboard_focus || !p.xkb_st || p.repeat_rate <= 0)
+            return;
+         auto const now = std::chrono::steady_clock::now();
+         if (now < p.repeat_next)
+            return;
+         p.repeat_next = now + std::chrono::microseconds(1000000 / p.repeat_rate);
+
+         xkb_keysym_t sym = XKB_KEY_NoSymbol;
+         xkb_layout_index_t const layout = xkb_state_key_get_layout(p.xkb_st, p.repeat_keycode);
+         xkb_keysym_t const* syms = nullptr;
+         if (layout != XKB_LAYOUT_INVALID
+            && xkb_keymap_key_get_syms_by_level(p.xkb_map, p.repeat_keycode, layout, 0, &syms) > 0)
+            sym = syms[0];
+         int const mods = get_mods();
+         if (auto kc = translate_key(sym); kc != key_code::unknown)
+            p.keyboard_focus->key({kc, key_action::repeat, mods});
+         uint32_t cp = xkb_state_key_get_utf32(p.xkb_st, p.repeat_keycode);
+         if (cp >= 0x20 && cp != 0x7F)
+            p.keyboard_focus->text({cp, mods});
+      }
+      void kb_mods(void*, wl_keyboard*, uint32_t, uint32_t dep, uint32_t lat, uint32_t lock, uint32_t group)
+      {
+         auto& p = plat();
+         if (p.xkb_st)
+            xkb_state_update_mask(p.xkb_st, dep, lat, lock, 0, 0, group);
+      }
+      void kb_repeat(void*, wl_keyboard*, int32_t rate, int32_t delay)
+      {
+         auto& p = plat();
+         p.repeat_rate = rate;
+         p.repeat_delay = delay;
+      }
+      constexpr wl_keyboard_listener keyboard_listener = {
+         kb_keymap, kb_enter, kb_leave, kb_key, kb_mods, kb_repeat
+      };
+
+      // --- output (per-monitor integer scale) ---
+      void out_geometry(void*, wl_output*, int32_t,int32_t,int32_t,int32_t,int32_t,const char*,const char*,int32_t) {}
+      void out_mode(void*, wl_output*, uint32_t,int32_t,int32_t,int32_t) {}
+      void out_done(void*, wl_output*) {}
+      void out_scale(void*, wl_output* o, int32_t factor) { plat().output_scale[o] = factor; }
+      void out_name(void*, wl_output*, const char*) {}
+      void out_description(void*, wl_output*, const char*) {}
+      constexpr wl_output_listener output_listener = {
+         out_geometry, out_mode, out_done, out_scale, out_name, out_description
+      };
+
+      // --- seat ---
+      // Uses the passed platform* (not plat()) — this can fire during the
+      // platform's own construction (registry roundtrip), and calling plat()
+      // then would re-enter the still-initializing function-local static.
+      void seat_caps(void* data, wl_seat* seat, uint32_t caps)
+      {
+         auto& p = *static_cast<platform*>(data);
+         if ((caps & WL_SEAT_CAPABILITY_POINTER) && !p.pointer)
+         {
+            p.pointer = wl_seat_get_pointer(seat);
+            wl_pointer_add_listener(p.pointer, &pointer_listener, nullptr);
+         }
+         if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !p.keyboard)
+         {
+            p.keyboard = wl_seat_get_keyboard(seat);
+            wl_keyboard_add_listener(p.keyboard, &keyboard_listener, nullptr);
+         }
+      }
+      void seat_name(void*, wl_seat*, const char*) {}
+      constexpr wl_seat_listener seat_listener = { seat_caps, seat_name };
+
+      void registry_global(void* data, wl_registry* reg, uint32_t name,
+                           const char* iface, uint32_t ver)
+      {
+         auto* p = static_cast<platform*>(data);
+         if (!strcmp(iface, wl_compositor_interface.name))
+            p->compositor = static_cast<wl_compositor*>(
+               wl_registry_bind(reg, name, &wl_compositor_interface, 4));
+         else if (!strcmp(iface, wl_shm_interface.name))
+            p->shm = static_cast<wl_shm*>(wl_registry_bind(reg, name, &wl_shm_interface, 1));
+         else if (!strcmp(iface, wl_output_interface.name))
+         {
+            auto* o = static_cast<wl_output*>(wl_registry_bind(reg, name, &wl_output_interface, 2));
+            p->output_scale[o] = 1;
+            wl_output_add_listener(o, &output_listener, nullptr);
+         }
+         else if (!strcmp(iface, wl_data_device_manager_interface.name))
+         {
+            p->data_device_manager_version = std::min<uint32_t>(ver, 3);
+            p->data_device_manager = static_cast<wl_data_device_manager*>(
+               wl_registry_bind(reg, name, &wl_data_device_manager_interface,
+                  p->data_device_manager_version));
+         }
+         else if (!strcmp(iface, zwp_text_input_manager_v3_interface.name))
+         {
+            p->text_input_manager = static_cast<zwp_text_input_manager_v3*>(
+               wl_registry_bind(reg, name, &zwp_text_input_manager_v3_interface, 1));
+         }
+         else if (!strcmp(iface, wl_seat_interface.name))
+         {
+            p->seat = static_cast<wl_seat*>(wl_registry_bind(reg, name, &wl_seat_interface, 5));
+            wl_seat_add_listener(p->seat, &seat_listener, p);   // pass platform*, not plat()
+         }
+      }
+   }
+
+   ////////////////////////////////////////////////////////////////////////////
+   // Input methods (text-input-v3)
+   ////////////////////////////////////////////////////////////////////////////
+   namespace
+   {
+      void ti_enter(void*, zwp_text_input_v3* ti, wl_surface* surf)
+      {
+         auto& p = plat();
+         auto i = p.views.find(surf);
+         p.text_input_view = (i != p.views.end()) ? i->second : nullptr;
+         if (!p.text_input_view)
+            return;
+         zwp_text_input_v3_enable(ti);
+         zwp_text_input_v3_set_content_type(ti,
+            ZWP_TEXT_INPUT_V3_CONTENT_HINT_NONE, ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_NORMAL);
+         auto const& r = p.text_caret;
+         zwp_text_input_v3_set_cursor_rectangle(ti,
+            int32_t(r.left), int32_t(r.top), int32_t(r.width()), int32_t(r.height()));
+         zwp_text_input_v3_commit(ti);
+      }
+
+      void ti_leave(void*, zwp_text_input_v3* ti, wl_surface*)
+      {
+         auto& p = plat();
+         if (p.text_input_view)
+            p.text_input_view->composition({});
+         p.text_input_view = nullptr;
+         zwp_text_input_v3_disable(ti);
+         zwp_text_input_v3_commit(ti);
+      }
+
+      void ti_preedit(void*, zwp_text_input_v3*, const char* text, int32_t cursor, int32_t)
+      {
+         auto& p = plat();
+         p.pending_preedit = text? text : "";
+         p.pending_cursor = cursor;
+      }
+
+      void ti_commit_string(void*, zwp_text_input_v3*, const char* text)
+      {
+         plat().pending_commit = text? text : "";
+      }
+
+      void ti_delete_surrounding(void*, zwp_text_input_v3*, uint32_t, uint32_t) {}
+
+      // The gathered events take effect together: the committed text is
+      // typed, then the composition, if any, is shown.
+      void ti_done(void*, zwp_text_input_v3*, uint32_t)
+      {
+         auto& p = plat();
+         auto* v = p.text_input_view;
+         auto preedit = std::exchange(p.pending_preedit, {});
+         auto commit = std::exchange(p.pending_commit, {});
+         auto cursor = std::exchange(p.pending_cursor, 0);
+         if (!v)
+            return;
+
+         if (!commit.empty())
+         {
+            v->composition({});
+            for (auto cp : to_utf32(commit))
+               v->text({cp, 0});
+         }
+
+         composition_info info;
+         info.text = to_utf32(preedit);
+         if (cursor > 0 && std::size_t(cursor) <= preedit.size())
+            info.cursor = to_utf32(preedit.substr(0, cursor)).size();
+         if (!info.text.empty() || commit.empty())
+            v->composition(info);
+      }
+
+      constexpr zwp_text_input_v3_listener text_input_listener = {
+         ti_enter, ti_leave, ti_preedit, ti_commit_string, ti_delete_surrounding, ti_done
+      };
+
+      void init_text_input(platform& p)
+      {
+         if (!p.text_input_manager || !p.seat)
+            return;
+         p.text_input = zwp_text_input_manager_v3_get_text_input(p.text_input_manager, p.seat);
+         zwp_text_input_v3_add_listener(p.text_input, &text_input_listener, nullptr);
+      }
+   }
+
+   wl_display*    get_display()    { return plat().display; }
+   libdecor*      get_libdecor()   { return plat().decor; }
+   wl_compositor* get_compositor() { return plat().compositor; }
+   wl_shm*        get_shm()        { return plat().shm; }
+
+   ////////////////////////////////////////////////////////////////////////////
+   // Rendering (wl_shm + Cairo)
+   ////////////////////////////////////////////////////////////////////////////
+   namespace
+   {
+      void render(base_view& view);   // fwd
+
+#if defined(ARTIST_CAIRO)
+      void destroy_buffer(shm_buffer& b)
+      {
+         if (b.cairo)  { cairo_surface_destroy(b.cairo); b.cairo = nullptr; }
+         if (b.buffer) { wl_buffer_destroy(b.buffer); b.buffer = nullptr; }
+         if (b.pool)   { wl_shm_pool_destroy(b.pool); b.pool = nullptr; }
+         if (b.data)   { munmap(b.data, b.size); b.data = nullptr; }
+         if (b.fd >= 0) { close(b.fd); b.fd = -1; }
+         b.busy = false;
+      }
+
+      void buffer_release(void* data, wl_buffer*)
+      {
+         auto* b = static_cast<shm_buffer*>(data);
+         b->busy = false;
+         if (b->owner && b->owner->pending && b->owner->self)
+            render(*b->owner->self);   // a deferred render can now proceed
+      }
+      constexpr wl_buffer_listener buffer_listener = { buffer_release };
+
+      void make_buffer(shm_buffer& b, host_view* h, int w, int hgt)
+      {
+         destroy_buffer(b);
+         b.owner = h;
+         b.stale = true;
+         b.has_damage = false;
+         int const stride = w * 4;
+         size_t const sz = size_t(stride) * hgt;
+         b.fd = memfd_create("elements-wl", MFD_CLOEXEC);
+         if (b.fd < 0 || ftruncate(b.fd, off_t(sz)) < 0)
+            throw std::runtime_error("shm alloc failed");
+         b.size = sz;
+         b.data = mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_SHARED, b.fd, 0);
+         b.pool = wl_shm_create_pool(plat().shm, b.fd, int32_t(sz));
+         b.buffer = wl_shm_pool_create_buffer(b.pool, 0, w, hgt, stride, WL_SHM_FORMAT_ARGB8888);
+         wl_buffer_add_listener(b.buffer, &buffer_listener, &b);
+#if defined(ARTIST_CAIRO)
+         b.cairo = cairo_image_surface_create_for_data(
+            static_cast<unsigned char*>(b.data), CAIRO_FORMAT_ARGB32, w, hgt, stride);
+         cairo_surface_set_device_scale(b.cairo, h->scale, h->scale);
+#endif
+      }
+
+      void create_buffer(host_view* h)
+      {
+         int const w = int(std::ceil(h->size.x * h->scale));
+         int const hgt = int(std::ceil(h->size.y * h->scale));
+         make_buffer(h->bufs[0], h, w, hgt);
+         make_buffer(h->bufs[1], h, w, hgt);
+      }
+
+      struct pixel_rect
+      {
+         int x, y, w, h;
+      };
+
+      // The buffer pixels covering a logical area, rounded outward and kept
+      // inside a max_w by max_h buffer.
+      pixel_rect pixel_bounds(double scale, rect area, int max_w, int max_h)
+      {
+         int const x1 = std::max(0, int(std::floor(area.left * scale)));
+         int const y1 = std::max(0, int(std::floor(area.top * scale)));
+         int const x2 = std::min(max_w, int(std::ceil(area.right * scale)));
+         int const y2 = std::min(max_h, int(std::ceil(area.bottom * scale)));
+         return {x1, y1, std::max(0, x2 - x1), std::max(0, y2 - y1)};
+      }
+
+      // The shm software path renders into a free buffer, deferring if both are
+      // still held by the compositor (re-driven from buffer_release).
+      void render_cairo(base_view& view)
+      {
+         auto* h = platform_access::get_host_view(view);
+         shm_buffer* b = !h->bufs[0].busy ? &h->bufs[0]
+                       : !h->bufs[1].busy ? &h->bufs[1] : nullptr;
+         if (!b || !b->buffer)
+         {
+            h->pending = true;
+            return;
+         }
+         h->pending = false;
+
+         // The two buffers alternate, so each carries the area it is behind
+         // by. Only that is drawn, through a clip, and only that is reported
+         // to the compositor as damaged.
+         rect const all{0, 0, h->size.x, h->size.y};
+         rect const area = (b->stale || !b->has_damage)?
+            all : artist::intersection(b->damage, all);
+         b->stale = false;
+         b->has_damage = false;
+         if (area.width() <= 0 || area.height() <= 0)
+            return;
+
+         auto const t0 = std::chrono::steady_clock::now();
+         auto* cr = cairo_create(b->cairo);
+         auto cnv = canvas{cr};
+         cnv.add_rect(area);
+         cnv.clip();
+         view.draw(cnv);
+         cairo_destroy(cr);
+         cairo_surface_flush(b->cairo);
+         double const draw_flush_ms =
+            std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - t0).count();
+         int const w = int(std::ceil(h->size.x * h->scale));
+         int const hgt = int(std::ceil(h->size.y * h->scale));
+         auto const px = pixel_bounds(h->scale, area, w, hgt);
+         b->busy = true;
+         wl_surface_attach(h->surface, b->buffer, 0, 0);
+         wl_surface_damage_buffer(h->surface, px.x, px.y, px.w, px.h);
+         wl_surface_commit(h->surface);
+         perf::record(draw_flush_ms);
+      }
+#elif defined(ARTIST_SKIA)
+      // EGL + Ganesh GL swap-chain path. One wl_egl_window backs an EGL window
+      // surface; Skia wraps its default framebuffer and eglSwapBuffers presents.
+      void init_egl(host_view* h)
+      {
+         h->egl_display = eglGetDisplay((EGLNativeDisplayType)plat().display);
+         if (h->egl_display == EGL_NO_DISPLAY
+            || !eglInitialize(h->egl_display, nullptr, nullptr))
+            throw std::runtime_error("EGL init failed");
+         eglBindAPI(EGL_OPENGL_API);
+
+         EGLint attribs[] = {
+            EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+            EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+            EGL_NONE
+         };
+         EGLConfig cfg = nullptr;
+         EGLint n = 0;
+         if (!eglChooseConfig(h->egl_display, attribs, &cfg, 1, &n) || n < 1)
+            throw std::runtime_error("No matching EGL config");
+
+         EGLint ctx_attribs[] = { EGL_NONE };
+         h->egl_context = eglCreateContext(h->egl_display, cfg, EGL_NO_CONTEXT, ctx_attribs);
+
+         int const pw = std::max(1, int(std::ceil(h->size.x * h->scale)));
+         int const ph = std::max(1, int(std::ceil(h->size.y * h->scale)));
+         h->egl_window = wl_egl_window_create(h->surface, pw, ph);
+         h->egl_surface = eglCreateWindowSurface(
+            h->egl_display, cfg, (EGLNativeWindowType)h->egl_window, nullptr);
+         if (h->egl_context == EGL_NO_CONTEXT || h->egl_surface == EGL_NO_SURFACE)
+            throw std::runtime_error("EGL context/surface creation failed");
+         if (!eglMakeCurrent(h->egl_display, h->egl_surface, h->egl_surface, h->egl_context))
+            throw std::runtime_error("eglMakeCurrent failed");
+         // Do not block the loop on vsync in the swap; the frame callback (see
+         // render_skia) throttles rendering to the compositor's cadence instead.
+         eglSwapInterval(h->egl_display, 0);
+
+         h->xface = GrGLMakeNativeInterface();
+         if (!h->xface)
+            h->xface = GrGLInterfaces::MakeEGL();
+         if (!h->xface)
+            throw std::runtime_error("GrGLMakeNativeInterface / MakeEGL failed");
+         h->ctx = GrDirectContexts::MakeGL(h->xface);
+         if (!h->ctx)
+            throw std::runtime_error("GrDirectContexts::MakeGL failed");
+
+         if (std::getenv("ELEMENTS_GL_INFO"))
+         {
+            auto s = [](GLenum e){ auto* p = glGetString(e); return p? (char const*)p : "?"; };
+            std::fprintf(stderr, "[gl] renderer=%s | vendor=%s | version=%s\n",
+               s(GL_RENDERER), s(GL_VENDOR), s(GL_VERSION));
+         }
+      }
+
+      // Resize the egl window to the physical size and rewrap the framebuffer.
+      void resize_backing(host_view* h)
+      {
+         int const pw = std::max(1, int(std::ceil(h->size.x * h->scale)));
+         int const ph = std::max(1, int(std::ceil(h->size.y * h->scale)));
+         h->pix_w = pw;
+         h->pix_h = ph;
+         wl_egl_window_resize(h->egl_window, pw, ph, 0, 0);
+         h->skia_surface.reset();
+         eglMakeCurrent(h->egl_display, h->egl_surface, h->egl_surface, h->egl_context);
+         GrGLFramebufferInfo info;
+         info.fFBOID  = 0;
+         info.fFormat = GL_RGBA8;
+         auto target = GrBackendRenderTargets::MakeGL(pw, ph, 0, 8, info);
+         h->skia_surface = SkSurfaces::WrapBackendRenderTarget(
+            h->ctx.get(), target, kBottomLeft_GrSurfaceOrigin,
+            kRGBA_8888_SkColorType, nullptr, nullptr);
+      }
+
+      void frame_done(void* data, wl_callback* cb, uint32_t);   // fwd
+      constexpr wl_callback_listener frame_listener = { frame_done };
+
+      void render_skia(base_view& view)
+      {
+         auto* h = platform_access::get_host_view(view);
+         if (!h->skia_surface)
+            return;
+
+         // Benchmarking renders back-to-back (no frame-callback throttle) so the
+         // frame period reflects true render throughput, not compositor cadence.
+         bool const bench = perf::enabled();
+
+         // Throttle: if a frame is still in flight, coalesce this request and
+         // let frame_done drive the next render. This is what keeps a burst of
+         // refreshes from firing a render (and a swap) on every loop iteration.
+         if (!bench && h->frame_pending)
+         {
+            h->needs_render = true;
+            return;
+         }
+
+         eglMakeCurrent(h->egl_display, h->egl_surface, h->egl_surface, h->egl_context);
+         auto const t0 = std::chrono::steady_clock::now();
+         SkCanvas* gpu = h->skia_surface->getCanvas();
+         gpu->save();
+         gpu->scale(h->scale, h->scale);   // logical → physical
+         auto cnv = canvas{gpu};
+         view.draw(cnv);
+         gpu->restore();
+         h->ctx->flushAndSubmit(h->skia_surface.get(),
+            perf::enabled()? GrSyncCpu::kYes : GrSyncCpu::kNo);
+         double const draw_flush_ms =
+            std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - t0).count();
+
+         if (!bench)
+         {
+            // Ask the compositor to tell us when this frame is on screen; the
+            // request is part of the surface state that eglSwapBuffers commits.
+            h->frame_cb = wl_surface_frame(h->surface);
+            wl_callback_add_listener(h->frame_cb, &frame_listener, h);
+            h->frame_pending = true;
+         }
+
+         eglSwapBuffers(h->egl_display, h->egl_surface);
+         perf::record(draw_flush_ms);
+      }
+
+      // Compositor has shown the last frame; render again only if something
+      // asked to while we were waiting.
+      void frame_done(void* data, wl_callback* cb, uint32_t)
+      {
+         auto* h = static_cast<host_view*>(data);
+         if (cb)
+            wl_callback_destroy(cb);
+         h->frame_cb = nullptr;
+         h->frame_pending = false;
+         if (h->needs_render && h->self)
+         {
+            h->needs_render = false;
+            render(*h->self);
+         }
+      }
+
+      void destroy_skia(host_view* h)
+      {
+         if (h->frame_cb)
+            { wl_callback_destroy(h->frame_cb); h->frame_cb = nullptr; }
+         h->skia_surface.reset();
+         h->ctx.reset();
+         h->xface.reset();
+         if (h->egl_surface != EGL_NO_SURFACE)
+            eglDestroySurface(h->egl_display, h->egl_surface);
+         if (h->egl_window)
+            wl_egl_window_destroy(h->egl_window);
+         if (h->egl_context != EGL_NO_CONTEXT)
+            eglDestroyContext(h->egl_display, h->egl_context);
+         if (h->egl_display != EGL_NO_DISPLAY)
+            eglTerminate(h->egl_display);
+      }
+#endif
+
+      // Add to the area each buffer is behind by, in logical coordinates. The
+      // Skia path draws every frame whole, so it keeps no damage.
+      void invalidate(host_view* h, rect area)
+      {
+#if defined(ARTIST_CAIRO)
+         for (auto& b : h->bufs)
+         {
+            b.damage = b.has_damage? artist::union_(b.damage, area) : area;
+            b.has_damage = true;
+         }
+#else
+         (void)h;
+         (void)area;
+#endif
+      }
+
+      void render(base_view& view)
+      {
+         auto* h = platform_access::get_host_view(view);
+         if (!h->configured)
+            return;
+#if defined(ARTIST_CAIRO)
+         render_cairo(view);
+#elif defined(ARTIST_SKIA)
+         render_skia(view);
+#endif
+      }
+
+      void update_view_scale(base_view* view)
+      {
+         auto* h = platform_access::get_host_view(*view);
+         int sc = 1;
+         for (auto* o : h->outputs)
+            if (auto it = plat().output_scale.find(o); it != plat().output_scale.end())
+               sc = std::max(sc, it->second);
+         if (double(sc) != h->scale)
+         {
+            h->scale = sc;
+            wl_surface_set_buffer_scale(h->surface, sc);
+            if (h->configured)
+            {
+               // Preserve the LOGICAL size across the scale change. Otherwise
+               // libdecor keeps the buffer size and halves the logical size
+               // (e.g. 640 logical → 320 on a 1×→2× move). A client-initiated
+               // state commit (null configuration) tells libdecor the content
+               // is still h->size logical, so it doubles the buffer instead.
+               auto* st = libdecor_state_new(
+                  int(std::lround(h->size.x)), int(std::lround(h->size.y)));
+               libdecor_frame_commit(h->frame, st, nullptr);
+               libdecor_state_free(st);
+#if defined(ARTIST_CAIRO)
+               create_buffer(h);
+#elif defined(ARTIST_SKIA)
+               resize_backing(h);
+#endif
+               view->on_scale_change(float(sc));
+               render(*view);
+            }
+         }
+      }
+      // The surface is the window's and outlives a view destroyed before
+      // it, so the view is found through the registry, which the view's
+      // destructor leaves, rather than the listener's data.
+      base_view* view_of(wl_surface* surface)
+      {
+         auto i = plat().views.find(surface);
+         return i == plat().views.end()? nullptr : i->second;
+      }
+
+      void surface_enter(void*, wl_surface* surface, wl_output* output)
+      {
+         if (auto* view = view_of(surface))
+         {
+            platform_access::get_host_view(*view)->outputs.insert(output);
+            update_view_scale(view);
+         }
+      }
+      void surface_leave(void*, wl_surface* surface, wl_output* output)
+      {
+         if (auto* view = view_of(surface))
+         {
+            platform_access::get_host_view(*view)->outputs.erase(output);
+            update_view_scale(view);
+         }
+      }
+      void surface_pref_scale(void*, wl_surface*, int32_t) {}
+      void surface_pref_transform(void*, wl_surface*, uint32_t) {}
+      constexpr wl_surface_listener surface_listener = {
+         surface_enter, surface_leave, surface_pref_scale, surface_pref_transform
+      };
+   }
+
+   ////////////////////////////////////////////////////////////////////////////
+   // Hooks called from window.cpp's libdecor frame callbacks
+   ////////////////////////////////////////////////////////////////////////////
+   void bind_view(host_window& w, base_view* view)
+   {
+      plat().views[get_surface(w)] = view;
+   }
+
+   void view_configure(host_window& w, int content_w, int content_h)
+   {
+      auto i = plat().views.find(get_surface(w));
+      if (i == plat().views.end())
+         return;
+      auto& view = *i->second;
+      auto* h = platform_access::get_host_view(view);
+      bool const opening = !h->configured;
+      bool const resized = h->size != point{float(content_w), float(content_h)};
+      h->size = {float(content_w), float(content_h)};
+      h->configured = true;
+      if (std::getenv("ELEMENTS_WL_DEBUG"))
+         std::fprintf(stderr, "[wl] configure content=%dx%d scale=%g buffer=%dx%d\n",
+            content_w, content_h, h->scale,
+            int(std::ceil(content_w * h->scale)), int(std::ceil(content_h * h->scale)));
+#if defined(ARTIST_CAIRO)
+      create_buffer(h);
+#elif defined(ARTIST_SKIA)
+      if (!h->egl_window)
+         init_egl(h);
+      resize_backing(h);
+#endif
+      if (opening)
+         view.on_open({h->size.x, h->size.y}, float(h->scale));
+      else if (resized)
+         view.on_size_change({h->size.x, h->size.y});
+   }
+
+   void view_render(host_window& w)
+   {
+      auto i = plat().views.find(get_surface(w));
+      if (i != plat().views.end())
+         render(*i->second);
+   }
+
+   ////////////////////////////////////////////////////////////////////////////
+   void dispatch_events()
+   {
+      wl_display_dispatch_pending(plat().display);
+      wl_display_flush(plat().display);
+   }
+
+   void poll_views()
+   {
+      repeat_key();
+      for (auto& [s, view] : plat().views)
+      {
+         view->poll();
+#if defined(ARTIST_CAIRO)
+         // A refresh only marks an area. Each view is drawn here, once,
+         // after its posted work has run, however many refreshes that
+         // work asked for.
+         if (platform_access::get_host_view(*view)->pending)
+            render(*view);
+#endif
+      }
+   }
+
+   ////////////////////////////////////////////////////////////////////////////
+   // base_view
+   ////////////////////////////////////////////////////////////////////////////
+   base_view::base_view(extent /*size_*/)
+    : _view(new host_view)
+   {
+      CYCFI_ASSERT(false, "Offscreen base_view unimplemented on Wayland");
+   }
+
+   base_view::base_view(host_view_handle h)
+    : _view(h)
+   {
+   }
+
+   base_view::base_view(host_window_handle h)
+    : _view(new host_view)
+   {
+      _view->self = this;
+      _view->surface = get_surface(*h);
+      _view->frame = get_frame(*h);
+
+      wl_surface_add_listener(_view->surface, &surface_listener, this);
+
+      bind_view(*h, this);
+   }
+
+   base_view::~base_view()
+   {
+      plat().views.erase(_view->surface);
+#if defined(ARTIST_CAIRO)
+      destroy_buffer(_view->bufs[0]);
+      destroy_buffer(_view->bufs[1]);
+#elif defined(ARTIST_SKIA)
+      destroy_skia(_view);
+#endif
+      delete _view;
+      _view = nullptr;
+   }
+
+   point base_view::cursor_pos() const { return _view->cursor_position; }
+
+   elements::extent base_view::size() const { return {_view->size.x, _view->size.y}; }
+
+   void base_view::size(elements::extent /*p*/) { /* window-driven; no-op */ }
+
+   // Skia draws once per compositor frame, so it is asked to render
+   // straight away. Cairo is drawn from poll_views.
+   void base_view::refresh()
+   {
+      invalidate(_view, {0, 0, _view->size.x, _view->size.y});
+#if defined(ARTIST_CAIRO)
+      _view->pending = true;
+#else
+      render(*this);
+#endif
+   }
+
+   void base_view::refresh(rect area)
+   {
+      invalidate(_view, area);
+#if defined(ARTIST_CAIRO)
+      _view->pending = true;
+#else
+      render(*this);
+#endif
+   }
+
+   void base_view::accept_drop_types(mime_types const& types)
+   {
+      _drop_types = types;
+   }
+
+   void base_view::text_caret(rect bounds)
+   {
+      auto& p = plat();
+      if (bounds == p.text_caret)
+         return;
+      p.text_caret = bounds;
+      if (p.text_input && p.text_input_view == this)
+      {
+         zwp_text_input_v3_set_cursor_rectangle(p.text_input,
+            int32_t(bounds.left), int32_t(bounds.top),
+            int32_t(bounds.width()), int32_t(bounds.height()));
+         zwp_text_input_v3_commit(p.text_input);
+      }
+   }
+
+   ////////////////////////////////////////////////////////////////////////////
+   // Data transfer: the clipboard and drag and drop
+   //
+   // Both come as a wl_data_offer on the seat's data device: the clipboard
+   // through the selection event, a drag through enter, motion and drop.
+   // An offer lists its MIME types; its data is read from a pipe, one type
+   // at a time. Our own clipboard is a wl_data_source, which writes the
+   // payload's entries to the pipes of whoever asks.
+   ////////////////////////////////////////////////////////////////////////////
+   namespace
+   {
+      // Read all a pipe gives until its writer closes it, waiting at most a
+      // second at a time for more.
+      std::optional<std::string> read_all(int fd)
+      {
+         std::string data;
+         char buf[65536];
+         for (;;)
+         {
+            pollfd pfd{fd, POLLIN, 0};
+            int n = poll(&pfd, 1, 1000);
+            if (n < 0 && errno == EINTR)
+               continue;
+            if (n <= 0)
+               return std::nullopt;       // the writer stalled
+            ssize_t r = read(fd, buf, sizeof buf);
+            if (r == 0)
+               return data;
+            if (r < 0)
+            {
+               if (errno == EINTR || errno == EAGAIN)
+                  continue;
+               return std::nullopt;
+            }
+            data.append(buf, std::size_t(r));
+         }
+      }
+
+      // Write all of the bytes to a pipe, waiting at most a second at a time
+      // for the reader to take more. A reader that goes away must not end
+      // the process with SIGPIPE, so the signal is held off meanwhile.
+      void write_all(int fd, std::string const& bytes)
+      {
+         sigset_t pipe_set, old_set;
+         sigemptyset(&pipe_set);
+         sigaddset(&pipe_set, SIGPIPE);
+         pthread_sigmask(SIG_BLOCK, &pipe_set, &old_set);
+
+         fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+         std::size_t done = 0;
+         while (done < bytes.size())
+         {
+            ssize_t n = write(fd, bytes.data() + done, bytes.size() - done);
+            if (n > 0)
+            {
+               done += std::size_t(n);
+            }
+            else if (n < 0 && errno == EINTR)
+            {
+               continue;
+            }
+            else if (n < 0 && errno == EAGAIN)
+            {
+               pollfd pfd{fd, POLLOUT, 0};
+               if (poll(&pfd, 1, 1000) <= 0)
+                  break;
+            }
+            else
+            {
+               break;                     // the reader went away
+            }
+         }
+
+         if (!sigismember(&old_set, SIGPIPE))
+         {
+            timespec zero{};
+            while (sigtimedwait(&pipe_set, nullptr, &zero) > 0)
+               ;                          // consume the SIGPIPE we held off
+            pthread_sigmask(SIG_SETMASK, &old_set, nullptr);
+         }
+      }
+
+      std::optional<std::string> receive(wl_data_offer* offer, std::string const& name)
+      {
+         auto& p = plat();
+         int fds[2];
+         if (pipe2(fds, O_CLOEXEC) != 0)
+            return std::nullopt;
+         wl_data_offer_receive(offer, name.c_str(), fds[1]);
+         close(fds[1]);
+         wl_display_flush(p.display);
+         auto data = read_all(fds[0]);
+         close(fds[0]);
+         return data;
+      }
+
+      // Read each of the MIME types asked for that the offer has.
+      payload receive_payload(wl_data_offer* offer, mime_types const& types)
+      {
+         payload result;
+         auto const& offered = plat().offers[offer];
+         for (auto const& mime : types)
+         {
+            if (auto name = transfer::best_name(mime, offered))
+            {
+               if (auto data = receive(offer, *name))
+                  result[mime] = transfer::from_wire(*name, mime, *data);
+            }
+         }
+         return result;
+      }
+
+      void forget_offer(wl_data_offer*& offer)
+      {
+         if (offer)
+         {
+            plat().offers.erase(offer);
+            wl_data_offer_destroy(offer);
+            offer = nullptr;
+         }
+      }
+
+      // --- data offer ---
+      void offer_offer(void*, wl_data_offer* offer, const char* mime_type)
+      {
+         plat().offers[offer].push_back(mime_type);
+      }
+      void offer_source_actions(void*, wl_data_offer*, uint32_t) {}
+      void offer_action(void*, wl_data_offer*, uint32_t) {}
+      constexpr wl_data_offer_listener data_offer_listener = {
+         offer_offer, offer_source_actions, offer_action
+      };
+
+      // --- data source (our clipboard) ---
+      void source_target(void*, wl_data_source*, const char*) {}
+      void source_send(void*, wl_data_source* source, const char* name, int32_t fd)
+      {
+         auto& p = plat();
+         if (source == p.clip_source)
+         {
+            if (auto mime = transfer::mime_type(name))
+            {
+               if (auto i = p.clip_data.find(*mime); i != p.clip_data.end())
+                  write_all(fd, transfer::to_wire(name, *mime, i->second));
+            }
+         }
+         close(fd);
+      }
+      void source_cancelled(void*, wl_data_source* source)
+      {
+         // Someone else's clipboard now.
+         auto& p = plat();
+         if (source == p.clip_source)
+         {
+            p.clip_source = nullptr;
+            p.clip_data.clear();
+         }
+         wl_data_source_destroy(source);
+      }
+      void source_dnd_drop_performed(void*, wl_data_source*) {}
+      void source_dnd_finished(void*, wl_data_source*) {}
+      void source_action(void*, wl_data_source*, uint32_t) {}
+      constexpr wl_data_source_listener data_source_listener = {
+         source_target, source_send, source_cancelled,
+         source_dnd_drop_performed, source_dnd_finished, source_action
+      };
+
+      // --- data device ---
+      void device_data_offer(void*, wl_data_device*, wl_data_offer* offer)
+      {
+         plat().offers[offer];
+         wl_data_offer_add_listener(offer, &data_offer_listener, nullptr);
+      }
+
+      void device_enter(void*, wl_data_device*, uint32_t serial, wl_surface* surface
+       , wl_fixed_t x, wl_fixed_t y, wl_data_offer* offer)
+      {
+         auto& p = plat();
+         forget_offer(p.dnd_offer);
+         p.dnd_offer = offer;
+         auto i = p.views.find(surface);
+         p.dnd_view = (i != p.views.end()) ? i->second : nullptr;
+         if (!offer)
+            return;                       // a drag with no data
+
+         auto const& offered = p.offers[offer];
+         std::vector<std::string> types;
+         if (p.dnd_view)
+         {
+            types = transfer::accepted_types(
+               transfer::mime_types_of(offered), p.dnd_view->accepted_drop_types());
+         }
+         if (types.empty())
+         {
+            wl_data_offer_accept(offer, serial, nullptr);
+            return;
+         }
+
+         // Accept, as a copy: what the drop is for is up to the view's
+         // elements, and a move would have the source delete its data.
+         auto name = transfer::best_name(types.front(), offered);
+         wl_data_offer_accept(offer, serial, name ? name->c_str() : offered.front().c_str());
+         if (p.data_device_manager_version >= 3)
+         {
+            wl_data_offer_set_actions(offer,
+               WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY,
+               WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
+         }
+
+         auto* h = platform_access::get_host_view(*p.dnd_view);
+         point pos{float(wl_fixed_to_double(x)), float(wl_fixed_to_double(y))};
+         h->cursor_position = pos;
+         h->_drop_info = std::make_unique<drop_info>();
+         for (auto const& type : types)
+            h->_drop_info->data[type] = std::string{};   // no data yet
+         h->_drop_info->where = pos;
+         p.dnd_view->track_drop(*h->_drop_info, cursor_tracking::entering);
+      }
+
+      void device_leave(void*, wl_data_device*)
+      {
+         auto& p = plat();
+         if (p.dnd_view)
+         {
+            auto* h = platform_access::get_host_view(*p.dnd_view);
+            if (h->_drop_info)
+            {
+               p.dnd_view->track_drop(*h->_drop_info, cursor_tracking::leaving);
+               h->_drop_info.reset();
+            }
+         }
+         p.dnd_view = nullptr;
+         forget_offer(p.dnd_offer);
+      }
+
+      void device_motion(void*, wl_data_device*, uint32_t, wl_fixed_t x, wl_fixed_t y)
+      {
+         auto& p = plat();
+         if (!p.dnd_view)
+            return;
+         auto* h = platform_access::get_host_view(*p.dnd_view);
+         if (!h->_drop_info)
+            return;
+         point pos{float(wl_fixed_to_double(x)), float(wl_fixed_to_double(y))};
+         h->cursor_position = pos;
+         h->_drop_info->where = pos;
+         p.dnd_view->track_drop(*h->_drop_info, cursor_tracking::hovering);
+      }
+
+      void device_drop(void*, wl_data_device*)
+      {
+         auto& p = plat();
+         if (!p.dnd_view || !p.dnd_offer)
+            return;
+         auto* h = platform_access::get_host_view(*p.dnd_view);
+         if (!h->_drop_info)
+            return;
+
+         mime_types types;
+         for (auto const& [type, data] : h->_drop_info->data)
+            types.insert(type);
+         auto data = receive_payload(p.dnd_offer, types);
+         if (!data.empty())
+         {
+            h->_drop_info->data = std::move(data);
+            p.dnd_view->drop(*h->_drop_info);
+         }
+         if (p.data_device_manager_version >= 3)
+            wl_data_offer_finish(p.dnd_offer);
+
+         // The drag ends here: no leave follows a drop.
+         h->_drop_info.reset();
+         p.dnd_view = nullptr;
+         forget_offer(p.dnd_offer);
+      }
+
+      void device_selection(void*, wl_data_device*, wl_data_offer* offer)
+      {
+         auto& p = plat();
+         if (p.selection_offer != offer)
+            forget_offer(p.selection_offer);
+         p.selection_offer = offer;
+      }
+
+      constexpr wl_data_device_listener data_device_listener = {
+         device_data_offer, device_enter, device_leave,
+         device_motion, device_drop, device_selection
+      };
+
+      void init_data_device(platform& p)
+      {
+         if (p.data_device_manager && p.seat && !p.data_device)
+         {
+            p.data_device = wl_data_device_manager_get_data_device(
+               p.data_device_manager, p.seat);
+            wl_data_device_add_listener(p.data_device, &data_device_listener, nullptr);
+         }
+      }
+
+      // Whether the clipboard is ours: the one we set, or, with no data
+      // device to share it through, the process's own.
+      bool own_clipboard()
+      {
+         auto& p = plat();
+         return p.clip_source || !p.data_device;
+      }
+   }
+
+   std::vector<std::string> clipboard_types()
+   {
+      auto& p = plat();
+      if (own_clipboard())
+      {
+         std::vector<std::string> types;
+         for (auto const& [type, data] : p.clip_data)
+            types.push_back(type);
+         return types;
+      }
+      if (!p.selection_offer)
+         return {};
+      return transfer::mime_types_of(p.offers[p.selection_offer]);
+   }
+
+   payload get_clipboard(mime_types const& types)
+   {
+      auto& p = plat();
+      if (own_clipboard())
+      {
+         payload result;
+         for (auto const& type : types)
+         {
+            if (auto i = p.clip_data.find(type); i != p.clip_data.end())
+               result[type] = transfer::as_received(type, i->second);
+         }
+         return result;
+      }
+      if (!p.selection_offer)
+         return {};
+      return receive_payload(p.selection_offer, types);
+   }
+
+   void set_clipboard(payload const& data)
+   {
+      auto& p = plat();
+      if (p.clip_source)
+      {
+         wl_data_source_destroy(p.clip_source);
+         p.clip_source = nullptr;
+      }
+      p.clip_data = data;
+      if (!p.data_device)
+         return;
+
+      wl_data_source* source = nullptr;
+      if (!data.empty())
+      {
+         source = wl_data_device_manager_create_data_source(p.data_device_manager);
+         wl_data_source_add_listener(source, &data_source_listener, nullptr);
+         for (auto const& [type, entry] : data)
+         {
+            for (auto const& name : transfer::native_names(type))
+               wl_data_source_offer(source, name.c_str());
+         }
+      }
+      // The compositor takes the clipboard only in answer to input: the
+      // serial is that of the latest key or button event.
+      wl_data_device_set_selection(p.data_device, source, p.input_serial);
+      p.clip_source = source;
+      wl_display_flush(p.display);
+   }
+
+   ////////////////////////////////////////////////////////////////////////////
+   // The cursor and the scroll direction
+   void set_cursor(cursor_type type)
+   {
+      auto& p = plat();
+      if (type == p.cursor)
+         return;
+      p.cursor = type;
+      apply_cursor();
+   }
+
+   // No registration step; resources are found by path (see gtk3 host).
+   void init_resources() {}
+   point scroll_direction() { return linux_host::scroll_direction(); }
+}

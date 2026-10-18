@@ -1,5 +1,5 @@
 /*=============================================================================
-   Copyright (c) 2016-2020 Joel de Guzman
+   Copyright (c) 2016-2023 Joel de Guzman
 
    Distributed under the MIT License (https://opensource.org/licenses/MIT)
 =============================================================================*/
@@ -7,6 +7,7 @@
 #include <sstream>
 
 using namespace cycfi::elements;
+using namespace cycfi::artist;
 
 // Main window background color
 auto constexpr bkd_color = rgba(35, 35, 37, 255);
@@ -15,7 +16,7 @@ auto background = box(bkd_color);
 template <typename E>
 auto decorate(E&& e)
 {
-   return hsize(170, align_center(margin({ 25, 5, 25, 5 },
+   return hsize(170, align_center(margin({25, 5, 25, 5},
       std::forward<E>(e)
    )));
 }
@@ -26,7 +27,7 @@ auto make_label(std::string text = "")
       .font_color(get_theme().indicator_hilite_color)
       .font_size(24)
    );
-};
+}
 
 auto make_thumbwheel1()
 {
@@ -39,7 +40,7 @@ auto make_thumbwheel1()
 
    auto tw = share(vthumbwheel(20, compose));
 
-   return top_margin(20,
+   return margin_top(20,
       layer(
          hold(tw),
          frame{}
@@ -62,7 +63,7 @@ auto make_thumbwheel2(char const* unit, float offset, float scale, int precision
 
    auto tw = share(thumbwheel(as_label<double>(as_string, label)));
 
-   return top_margin(20,
+   return margin_top(20,
       layer(
          hold(tw),
          frame{}
@@ -79,20 +80,24 @@ auto make_xy_thumbwheel()
       {
          auto& cnv = ctx.canvas;
          cnv.begin_path();
-         cnv.round_rect(ctx.bounds, get_theme().frame_corner_radius);
+         cnv.add_round_rect(ctx.bounds, get_theme().frame_corner_radius);
          cnv.fill_style(color(val.x, 0.0, 1.0).level(val.y));
          cnv.fill();
       };
 
-   auto tw = share(thumbwheel(fixed_size({ 170, 36 }, draw_value<point>(draw))));
-   tw->value({ 0.25f, 0.25f });
+   auto tw = share(thumbwheel(fixed_size({170, 36}, draw_value<point>(draw))));
+   tw->value({0.25f, 0.25f});
 
-   return top_margin(20, hold(tw));
+   return margin_top(20, hold(tw));
 }
 
 int main(int argc, char* argv[])
 {
-   app _app(argc, argv, "Thumbwheels", "com.cycfi.thumbwheels");
+   app _app("Thumbwheels");
+
+   // Set up the fonts and search paths once, at startup, so the
+   // first window does not pay for it.
+   init_resources();
    window _win(_app.name());
    _win.on_close = [&_app]() { _app.stop(); };
 
@@ -100,7 +105,7 @@ int main(int argc, char* argv[])
 
    view_.content(
 
-      margin({ 20, 0, 20, 20 },
+      margin({20, 0, 20, 20},
          vtile(
             align_center_middle(make_thumbwheel1()),
             align_center_middle(make_thumbwheel2(" Hz", 20, 100, 2)),

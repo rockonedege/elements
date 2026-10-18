@@ -1,17 +1,17 @@
 /*=============================================================================
-   Copyright (c) 2016-2020 Joel de Guzman
+   Copyright (c) 2016-2023 Joel de Guzman
 
    Distributed under the MIT License [ https://opensource.org/licenses/MIT ]
 =============================================================================*/
 #if !defined(ELEMENTS_TRACKER_AUGUST_29_2016)
 #define ELEMENTS_TRACKER_AUGUST_29_2016
 
-#include <elements/support/point.hpp>
+#include <artist/point.hpp>
 #include <elements/element/element.hpp>
 #include <memory>
 #include <type_traits>
 
-namespace cycfi { namespace elements
+namespace cycfi::elements
 {
    struct tracker_info
    {
@@ -28,14 +28,15 @@ namespace cycfi { namespace elements
       point             start;
       point             current = start;
       point             previous = start;
-      point             offset = point{ 0, 0 };
+      point             offset = point{0, 0};
       int               modifiers = 0;
+      bool              processed = true;
    };
 
    ////////////////////////////////////////////////////////////////////////////
    // tracker tracks the mouse movement.
    ////////////////////////////////////////////////////////////////////////////
-   template <typename Base = element, typename TrackerInfo = tracker_info>
+   template <concepts::Element Base = element, typename TrackerInfo = tracker_info>
    class tracker : public Base
    {
    public:
@@ -58,6 +59,9 @@ namespace cycfi { namespace elements
 
       tracker_info*           get_state() { return state.get(); }
       tracker_info const*     get_state() const { return state.get(); }
+      bool                    is_tracking() const { return state.get() != nullptr; }
+
+      void                    escape_tracking(context const& ctx);
 
    protected:
 
@@ -79,20 +83,20 @@ namespace cycfi { namespace elements
    ////////////////////////////////////////////////////////////////////////////
    inline point tracker_info::distance() const
    {
-      return { current.x-start.x, current.y-start.y };
+      return {current.x-start.x, current.y-start.y};
    }
 
    inline point tracker_info::movement() const
    {
-      return { current.x-previous.x, current.y-previous.y };
+      return {current.x-previous.x, current.y-previous.y};
    }
 
-   template <typename Base, typename TrackerInfo>
+   template <concepts::Element Base, typename TrackerInfo>
    tracker<Base, TrackerInfo>::tracker(tracker const& rhs)
     : Base(rhs)
    {}
 
-   template <typename Base, typename TrackerInfo>
+   template <concepts::Element Base, typename TrackerInfo>
    tracker<Base, TrackerInfo>&
    tracker<Base, TrackerInfo>::operator=(tracker const& rhs)
    {
@@ -101,29 +105,41 @@ namespace cycfi { namespace elements
       return *this;
    }
 
-   template <typename Base, typename TrackerInfo>
+   template <concepts::Element Base, typename TrackerInfo>
    inline bool
    tracker<Base, TrackerInfo>::click(context const& ctx, mouse_button btn)
    {
+      Base::click(ctx, btn);
+      bool processed = true;
       if (btn.down)
       {
          state = new_state(ctx, btn.pos, btn.modifiers);
          this->on_tracking(ctx, element::begin_tracking);
          begin_tracking(ctx, *state);
+         processed = state->processed;
+         if (!processed)
+         {
+            // A declined press gets no release, so the state would
+            // otherwise linger until the next press.
+            this->on_tracking(ctx, element::end_tracking);
+            state.reset();
+         }
       }
       else if (state)
       {
          this->on_tracking(ctx, element::end_tracking);
          end_tracking(ctx, *state);
+         processed = state->processed;
          state.reset();
       }
-      return true;
+      return processed;
    }
 
-   template <typename Base, typename TrackerInfo>
+   template <concepts::Element Base, typename TrackerInfo>
    inline void
    tracker<Base, TrackerInfo>::drag(context const& ctx, mouse_button btn)
    {
+      Base::drag(ctx, btn);
       if (state)
       {
          state->previous = state->current;
@@ -135,19 +151,31 @@ namespace cycfi { namespace elements
       }
    }
 
-   template <typename Base, typename TrackerInfo>
+   template <concepts::Element Base, typename TrackerInfo>
    inline typename tracker<Base, TrackerInfo>::tracker_info_ptr
    tracker<Base, TrackerInfo>::new_state(context const& /* ctx */, point start, int modifiers)
    {
       return std::make_unique<tracker_info>(start, modifiers);
    }
 
-   template <typename Base, typename TrackerInfo>
+   template <concepts::Element Base, typename TrackerInfo>
    inline void
    tracker<Base, TrackerInfo>::track_scroll(context const& ctx, point /* dir */, point /* p */)
    {
       this->on_tracking(ctx, element::while_tracking);
    }
-}}
+
+   template <concepts::Element Base, typename TrackerInfo>
+   inline void
+   tracker<Base, TrackerInfo>::escape_tracking(context const& ctx)
+   {
+      if (state)
+      {
+         this->on_tracking(ctx, element::end_tracking);
+         end_tracking(ctx, *state);
+         state.reset();
+      }
+   }
+}
 
 #endif

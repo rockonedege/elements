@@ -1,30 +1,67 @@
 /*=============================================================================
-   Copyright (c) 2016-2020 Joel de Guzman
+   Copyright (c) 2016-2023 Joel de Guzman
 
    Distributed under the MIT License [ https://opensource.org/licenses/MIT ]
 =============================================================================*/
 #include <elements/view.hpp>
 #include <elements/window.hpp>
 #include <elements/support/context.hpp>
+#include <elements/support/log.hpp>
+#include <elements/support/trace.hpp>
+#include <elements/element/traversal.hpp>
+#include <elements/element/text.hpp>
+#include <algorithm>
 
- namespace cycfi { namespace elements
- {
+namespace cycfi::elements
+{
+   using artist::image;
+   using artist::offscreen_image;
+
+   namespace
+   {
+      // The next composite down a focus path from e: e itself, or the
+      // subject of the proxies and links that wrap it.
+      composite_base* next_composite(element* e)
+      {
+         while (e)
+         {
+            if (auto* i = dynamic_cast<indirect_base*>(e))
+               e = &i->get();
+            else if (auto* c = dynamic_cast<composite_base*>(e))
+               return c;
+            else if (auto* p = dynamic_cast<proxy_base*>(e))
+               e = &p->subject();
+            else
+               return nullptr;
+         }
+         return nullptr;
+      }
+   }
+
    view::view(extent size_)
     : base_view(size_)
     , _main_element(make_scaled_content())
-    , _work(_io)
+    , _work(asio::make_work_guard(_io))
    {}
 
    view::view(host_view_handle h)
     : base_view(h)
     , _main_element(make_scaled_content())
-    , _work(_io)
+    , _work(asio::make_work_guard(_io))
    {}
+
+#if defined(ELEMENTS_HOST_UI_LIBRARY_X11)
+   view::view(unsigned long parent)
+    : base_view(parent)
+    , _main_element(make_scaled_content())
+    , _work(asio::make_work_guard(_io))
+   {}
+#endif
 
    view::view(window& win)
     : base_view(win.host())
     , _main_element(make_scaled_content())
-    , _work(_io)
+    , _work(asio::make_work_guard(_io))
    {
       on_change_limits = [&win](view_limits limits_)
       {
@@ -43,13 +80,12 @@
       if (_content.empty())
          return;
 
-      auto surface_ = cairo_recording_surface_create(CAIRO_CONTENT_COLOR_ALPHA, nullptr);
-      auto context_ = cairo_create(surface_);
-      canvas cnv{ *context_ };
-      cnv.pre_scale(hdpi_scale());
+      image img{1, 1};
+      offscreen_image offscr{img};
+      canvas cnv{offscr.context()};
 
       // Update the limits and constrain the window size to the limits
-      basic_context bctx{ *this, cnv };
+      basic_context bctx{*this, cnv};
       auto limits_ = _main_element.limits(bctx);
       if (limits_.min != _current_limits.min || limits_.max != _current_limits.max)
       {
@@ -57,32 +93,27 @@
          if (on_change_limits)
             on_change_limits(limits_);
       }
-
-      cairo_surface_destroy(surface_);
-      cairo_destroy(context_);
    }
 
-   void view::draw(cairo_t* context_, rect dirty_)
+   void view::draw(canvas& cnv)
    {
       if (_content.empty())
          return;
 
-      _dirty = dirty_;
-
       // Update the limits and constrain the window size to the limits
       set_limits();
 
-      canvas cnv{ *context_ };
-      cnv.pre_scale(hdpi_scale());
       auto size_ = size();
-      rect subj_bounds = { 0, 0, size_.x, size_.y };
-      context ctx{ *this, cnv, &_main_element, subj_bounds };
+      rect subj_bounds = {0, 0, size_.x, size_.y};
+      context ctx{*this, cnv, &_main_element, subj_bounds};
 
       // layout the subject only if the window bounds changes
       if (subj_bounds != _current_bounds)
       {
          _current_bounds = subj_bounds;
          _main_element.layout(ctx);
+         update_drop_types();
+         update_hotkeys();
       }
 
       // draw the subject
@@ -92,27 +123,51 @@
    namespace
    {
       template <typename F, typename This>
-      void call(F f, This& self, rect _current_bounds)
+      void with_context_do(F f, This& self, rect _current_bounds)
       {
-         auto surface_ = cairo_recording_surface_create(CAIRO_CONTENT_COLOR_ALPHA, nullptr);
-         auto context_ = cairo_create(surface_);
-         canvas cnv{ *context_ };
-         cnv.pre_scale(self.hdpi_scale());
-         context ctx { self, cnv, &self.main_element(), _current_bounds };
+         image img{1, 1};
+         offscreen_image offscr{img};
+         canvas cnv{offscr.context()};
+         context ctx {self, cnv, &self.main_element(), _current_bounds};
 
          f(ctx, self.main_element());
-
-         cairo_surface_destroy(surface_);
-         cairo_destroy(context_);
       }
+   }
+
+   // Tell the host the MIME types the content takes drops of, when they
+   // change. Asked when the content is set and laid out, not on every
+   // draw: it is a walk of the whole element tree.
+   void view::update_drop_types()
+   {
+      auto types = _main_element.drop_types();
+      if (!_drop_types || types != *_drop_types)
+      {
+         _drop_types = types;
+         accept_drop_types(types);
+      }
+   }
+
+   // Ask the content which of its elements take hotkeys, when the content
+   // is set or laid out: each container keeps its own.
+   void view::update_hotkeys()
+   {
+      with_context_do(
+         [](auto const& ctx, auto& _main_element)
+         {
+            _main_element.hotkey(ctx, hotkey_test);
+         },
+         *this, _current_bounds
+      );
    }
 
    void view::layout()
    {
+      update_drop_types();
+      update_hotkeys();
       if (_current_bounds.is_empty())
          return;
 
-      call(
+      with_context_do(
          [](auto const& ctx, auto& _main_element) { _main_element.layout(ctx); },
          *this, _current_bounds
       );
@@ -120,12 +175,14 @@
       refresh();
    }
 
-   void view::layout(element &element)
+   void view::layout(element& element)
    {
+      update_drop_types();
+      update_hotkeys();
       if (_current_bounds.is_empty())
          return;
 
-      call(
+      with_context_do(
          [](auto const& ctx, auto& _main_element) { _main_element.layout(ctx); },
          *this, _current_bounds
       );
@@ -141,13 +198,37 @@
    void view::scale(float val)
    {
       _main_element.scale(val);
+      set_limits();
       refresh();
+   }
+
+   void view::on_size_change(extent size_)
+   {
+      LOG_INFO(logger(log_cat::view),
+         "on_size_change {}x{}", size_.x, size_.y);
+   }
+
+   void view::on_scale_change(float scale_)
+   {
+      LOG_INFO(logger(log_cat::view),
+         "on_scale_change {}", scale_);
+   }
+
+   void view::on_open(extent size_, float scale)
+   {
+      LOG_INFO(logger(log_cat::view),
+         "on_open {}x{} scale={}", size_.x, size_.y, scale);
+   }
+
+   void view::on_close()
+   {
+      LOG_INFO(logger(log_cat::view), "on_close");
    }
 
    void view::refresh()
    {
       // Allow refresh to be called from another thread
-      _io.post(
+      asio::post(_io,
          [this]()
          {
             base_view::refresh();
@@ -158,7 +239,7 @@
    void view::refresh(rect area)
    {
       // Allow refresh to be called from another thread
-      _io.post(
+      asio::post(_io,
          [this, area]()
          {
             base_view::refresh(area);
@@ -166,23 +247,65 @@
       );
    }
 
+   void view::refresh(context const& ctx, rect area)
+   {
+      auto tl = ctx.canvas.user_to_device(area.top_left());
+      auto br = ctx.canvas.user_to_device(area.bottom_right());
+      refresh({tl.x, tl.y, br.x, br.y});
+   }
+
    void view::refresh(element& element, int outward)
    {
       if (_current_bounds.is_empty())
          return;
 
-      _io.post(
-         [this, &element, outward]()
-         {
-            call(
-               [&element, outward](auto const& ctx, auto& _main_element)
-               {
-                  _main_element.refresh(ctx, element, outward);
-               },
-               *this, _current_bounds
-            );
-         }
-      );
+      // Gathered, and refreshed together at the next poll. Refresh may
+      // be called from another thread, hence the lock.
+      bool first = false;
+      {
+         std::lock_guard<std::mutex> lock(_pending_mutex);
+         first = _pending.empty();
+         pending_refresh const entry{&element, outward};
+         if (std::find(_pending.begin(), _pending.end(), entry)
+            == _pending.end())
+            _pending.push_back(entry);
+      }
+      if (first)
+         asio::post(_io, [this]() { refresh_pending(); });
+   }
+
+   // Refreshing an element searches the tree for it, computing the
+   // layout on the way down, so each one costs as much as the tree is
+   // big: about 5 ms in a Debug build of a 150 parameter plugin editor.
+   // A few are refreshed where they are, which keeps a drag redrawing
+   // only its control and its readout; past that, the whole view is
+   // refreshed once, and drawn once.
+   void view::refresh_pending()
+   {
+      constexpr std::size_t max_searches = 4;
+
+      std::vector<pending_refresh> pending;
+      {
+         std::lock_guard<std::mutex> lock(_pending_mutex);
+         pending.swap(_pending);
+      }
+
+      if (pending.size() > max_searches)
+      {
+         base_view::refresh();
+         return;
+      }
+
+      for (auto [e, outward] : pending)
+      {
+         with_context_do(
+            [e, outward](auto const& ctx, auto& _main_element)
+            {
+               _main_element.refresh(ctx, *e, outward);
+            },
+            *this, _current_bounds
+         );
+      }
    }
 
    void view::refresh(context const& ctx, int outward)
@@ -197,7 +320,7 @@
       {
          auto tl = ctx.canvas.user_to_device(ctx_ptr->bounds.top_left());
          auto br = ctx.canvas.user_to_device(ctx_ptr->bounds.bottom_right());
-         refresh({ tl.x, tl.y, br.x, br.y });
+         refresh({tl.x, tl.y, br.x, br.y});
       }
    }
 
@@ -207,14 +330,77 @@
       if (_content.empty())
          return;
 
-      call(
-         [btn, this](auto const& ctx, auto& _main_element)
+      trace_new_gesture("click");
+      if (btn.down)
+         _click_focus = current_focus_path();
+
+      bool handled = false;
+      with_context_do(
+         [btn, this, &handled](auto const& ctx, auto& _main_element)
          {
-            _main_element.click(ctx, btn);
-            _is_focus = _main_element.focus();
+            handled = _main_element.click(ctx, btn);
+            if (handled)
+               _is_focus = _main_element.focus();
+            else if (btn.down)
+               elements::relinquish_focus(_content, ctx);
+            refresh(_main_element);
          },
          *this, _current_bounds
       );
+
+      // A layer this click opens is added after it returns (see add), so
+      // the focus it held is kept until then.
+      if (!btn.down)
+         asio::post(_io, [this]{ _click_focus.reset(); });
+      LOG_DEBUG(logger(log_cat::input),
+         "click {},{} btn={} down={} clicks={} handled={}",
+         btn.pos.x, btn.pos.y, int(btn.state), btn.down, btn.num_clicks, handled);
+   }
+
+   view::focus_path view::current_focus_path()
+   {
+      focus_path path;
+      composite_base* c = &_content;
+      while (c && c->_focus != -1 && c->_focus < int(c->size()))
+      {
+         path.emplace_back(c, c->_focus);
+         c = next_composite(&c->at(c->_focus));
+      }
+      return path;
+   }
+
+   // Called by add once the focus has ended: the composites on the path
+   // held when the button went down remember it, so the focus goes back
+   // there when the new layer closes. Every link is checked against the
+   // tree as it is now; if one has gone, the focus is left as it ended.
+   void view::save_click_focus()
+   {
+      if (!_click_focus)
+         return;
+      auto path = std::move(*_click_focus);
+      _click_focus.reset();
+
+      composite_base* c = &_content;
+      for (auto [pc, ix] : path)
+      {
+         if (pc != c || ix >= int(c->size()))
+            return;
+         c = next_composite(&c->at(ix));
+      }
+
+      if (path.empty())
+      {
+         // Nothing had the focus: forget what the click gave it to.
+         for (c = &_content; c && c->_saved_focus != -1;)
+         {
+            auto ix = std::exchange(c->_saved_focus, -1);
+            c = ix < int(c->size())? next_composite(&c->at(ix)) : nullptr;
+         }
+         return;
+      }
+
+      for (auto [pc, ix] : path)
+         pc->_saved_focus = ix;
    }
 
    void view::drag(mouse_button btn)
@@ -223,7 +409,8 @@
       if (_content.empty())
          return;
 
-      call(
+      trace_new_gesture("drag");
+      with_context_do(
          [btn](auto const& ctx, auto& _main_element)
          {
             _main_element.drag(ctx, btn);
@@ -237,7 +424,7 @@
       if (_content.empty())
          return;
 
-      call(
+      with_context_do(
          [p, status](auto const& ctx, auto& _main_element)
          {
             if (!_main_element.cursor(ctx, p, status))
@@ -252,13 +439,15 @@
       if (_content.empty())
          return;
 
-      call(
+      with_context_do(
          [dir, p](auto const& ctx, auto& _main_element)
          {
             _main_element.scroll(ctx, dir, p);
          },
          *this, _current_bounds
       );
+      LOG_DEBUG(logger(log_cat::input),
+         "scroll dir={},{} pos={},{}", dir.x, dir.y, p.x, p.y);
    }
 
    bool view::key(key_info const& k)
@@ -267,30 +456,79 @@
          return false;
 
       bool handled = false;
-      call(
+      with_context_do(
          [k, &handled](auto const& ctx, auto& _main_element)
          {
-             handled = _main_element.key(ctx, k);
+            handled = _main_element.key(ctx, k);
+
+            // A press the focus did not take may be a hotkey.
+            if (!handled
+               && (k.action == key_action::press || k.action == key_action::repeat))
+               handled = _main_element.hotkey(ctx, k);
+         },
+         *this, _current_bounds
+      );
+      LOG_DEBUG(logger(log_cat::input),
+         "key code={} action={} handled={}",
+         int(k.key), int(k.action), handled);
+      return handled;
+   }
+
+   bool view::text(text_info const& info_)
+   {
+      if (_content.empty())
+         return false;
+
+      // A host that hands over UTF-16, as Windows does with WM_CHAR, sends a
+      // character outside the basic plane as two surrogates. Join them into
+      // one character; drop a half that has no partner.
+      auto info = info_;
+      auto cp = info.codepoint;
+      if (cp >= 0xD800 && cp <= 0xDBFF)
+      {
+         _high_surrogate = cp;
+         return true;
+      }
+      if (cp >= 0xDC00 && cp <= 0xDFFF)
+      {
+         auto high = _high_surrogate;
+         _high_surrogate = 0;
+         if (high == 0)
+            return true;
+         info.codepoint = 0x10000 + ((high - 0xD800) << 10) + (cp - 0xDC00);
+      }
+      else
+      {
+         _high_surrogate = 0;
+      }
+
+      bool handled = false;
+      with_context_do(
+         [info, &handled](auto const& ctx, auto& _main_element)
+         {
+            handled = _main_element.text(ctx, info);
          },
          *this, _current_bounds
       );
       return handled;
    }
 
-   bool view::text(text_info const& info)
+   // An input method's composition goes to the text box that has the
+   // focus, if the focus is in one.
+   void view::composition(composition_info const& info)
    {
-      if (_content.empty())
-         return false;
-
-      bool handled = false;
-      call(
-         [info, &handled](auto const& ctx, auto& _main_element)
-         {
-             handled = _main_element.text(ctx, info);
-         },
-         *this, _current_bounds
-      );
-      return handled;
+      element* e = nullptr;
+      composite_base* c = &_content;
+      while (c && c->_focus != -1 && c->_focus < int(c->size()))
+      {
+         e = &c->at(c->_focus);
+         c = next_composite(e);
+      }
+      if (auto* box = e? find_element<basic_text_box*>(e) : nullptr)
+      {
+         box->composition(info);
+         refresh();
+      }
    }
 
    void view::add_undo(undo_redo_task f)
@@ -304,28 +542,33 @@
       }
    }
 
+   // A task that no longer applies is dropped, and the next one tried.
    bool view::undo()
    {
-      if (has_undo())
+      while (has_undo())
       {
          auto t = _undo_stack.top();
          _undo_stack.pop();
-         _redo_stack.push(t);
-         t.undo();  // execute undo function
-         return true;
+         if (t.undo())
+         {
+            _redo_stack.push(t);
+            return true;
+         }
       }
       return false;
    }
 
    bool view::redo()
    {
-      if (has_redo())
+      while (has_redo())
       {
          auto t = _redo_stack.top();
-         _undo_stack.push(t);
          _redo_stack.pop();
-         t.redo();  // execute redo function
-         return true;
+         if (t.redo())
+         {
+            _undo_stack.push(t);
+            return true;
+         }
       }
       return false;
    }
@@ -335,17 +578,67 @@
       if (_content.empty() || !_is_focus)
          return;
 
-      _main_element.begin_focus();
+      _main_element.begin_focus(element::focus_request::restore_previous);
       refresh();
    }
 
    void view::end_focus()
    {
-      if (_content.empty() || !_is_focus)
+      if (_content.empty())
          return;
 
       _main_element.end_focus();
       refresh();
+   }
+
+   void view::relinquish_focus()
+   {
+      if (_content.focus_index() != -1)
+      {
+         with_context_do(
+            [this](auto const& ctx, auto& /*_main_element*/)
+            {
+               ctx.element->in_context_do(ctx, _content,
+                  [this](auto const& ctx)
+                  {
+                     elements::relinquish_focus(_content, ctx);
+                  }
+               );
+            },
+            *this, _current_bounds
+         );
+      }
+      _is_focus = false;
+   }
+
+   void view::track_drop(drop_info const& info, cursor_tracking status)
+   {
+      if (_content.empty())
+         return;
+
+      with_context_do(
+         [info, status](auto const& ctx, auto& _main_element)
+         {
+            _main_element.track_drop(ctx, info, status);
+         },
+         *this, _current_bounds
+      );
+   }
+
+   bool view::drop(drop_info const& info)
+   {
+      if (_content.empty())
+         return false;
+
+      bool handled = false;
+      with_context_do(
+         [info, &handled](auto const& ctx, auto& _main_element)
+         {
+            handled = _main_element.drop(ctx, info);
+         },
+         *this, _current_bounds
+      );
+      return handled;
    }
 
    void view::poll()
@@ -382,4 +675,18 @@
       if (state == tracking::end_tracking)
          _tracking.erase(&e);
    }
-}}
+
+   void view::in_context_do(element& e, context_function f)
+   {
+      if (_content.empty())
+         return;
+
+      with_context_do(
+         [&e, &f](auto const& ctx, auto& _main_element)
+         {
+            _main_element.in_context_do(ctx, e, f);
+         },
+         *this, _current_bounds
+      );
+   }
+}

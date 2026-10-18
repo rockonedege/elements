@@ -1,5 +1,5 @@
 /*=============================================================================
-   Copyright (c) 2016-2020 Joel de Guzman
+   Copyright (c) 2016-2023 Joel de Guzman
 
    Distributed under the MIT License (https://opensource.org/licenses/MIT)
 =============================================================================*/
@@ -13,7 +13,7 @@
 using GtkApplication = struct _GtkApplication;
 #endif
 
-namespace cycfi { namespace elements
+namespace cycfi::elements
 {
    ////////////////////////////////////////////////////////////////////////////
    // Application class
@@ -21,11 +21,12 @@ namespace cycfi { namespace elements
    class app : non_copyable
    {
    public:
-                           app(
-                              int argc
-                            , char* argv[]
-                            , std::string name
-                            , std::string id);
+                           [[deprecated("We no longer use argc, argv and the app id")]]
+                           app(int /*argc*/, char* /*argv*/[], std::string name, std::string /*id*/)
+                            : app{name}
+                           {}
+
+                           app(std::string name);
                            ~app();
 
       std::string const&   name() const { return _app_name; }
@@ -34,17 +35,23 @@ namespace cycfi { namespace elements
 
    private:
 
+      void                 on_start();
+      void                 on_stop();
+
 #if defined(ELEMENTS_HOST_UI_LIBRARY_COCOA)
       void* _menubar;
 #elif defined(ELEMENTS_HOST_UI_LIBRARY_GTK)
       GtkApplication* _app;
 #elif defined(ELEMENTS_HOST_UI_LIBRARY_WIN32)
       bool  _running = true;
+#elif defined(ELEMENTS_HOST_UI_LIBRARY_X11) || defined(ELEMENTS_HOST_UI_LIBRARY_WAYLAND) \
+   || defined(ELEMENTS_HOST_UI_LIBRARY_HEADLESS)
+      bool  _running = true;
 #endif
 
       std::string          _app_name;
    };
-}}
+}
 
 #endif
 

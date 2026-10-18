@@ -1,16 +1,18 @@
 /*=============================================================================
-   Copyright (c) 2016-2020 Joel de Guzman
+   Copyright (c) 2016-2023 Joel de Guzman
 
    Distributed under the MIT License [ https://opensource.org/licenses/MIT ]
 =============================================================================*/
 #include <elements/element/port.hpp>
 #include <elements/element/traversal.hpp>
 #include <elements/view.hpp>
+#include <elements/support/theme.hpp>
 #include <algorithm>
 #include <cmath>
 
-namespace cycfi { namespace elements
+namespace cycfi::elements
 {
+   using artist::color;
    constexpr auto min_port_size = 32;
 
    ////////////////////////////////////////////////////////////////////////////
@@ -19,18 +21,39 @@ namespace cycfi { namespace elements
    void port_base::draw(context const& ctx)
    {
       auto state = ctx.canvas.new_state();
-      ctx.canvas.rect(ctx.bounds);
+      ctx.canvas.add_rect(ctx.bounds);
       ctx.canvas.clip();
       proxy_base::draw(ctx);
    }
 
-   ////////////////////////////////////////////////////////////////////////////
-   // port_element class implementation
-   ////////////////////////////////////////////////////////////////////////////
+   /**
+    * @brief
+    *    Utility to find the bounds established by the innermost port given a
+    *    child context. If there is none, returns ctx.view_bounds().
+    *
+    *    This utility function searches for the bounds of the innermost port.
+    *    If no port is found, the function returns the view's bounds.
+    *
+    * @param ctx
+    *    The context of the child element for which the port bounds are being
+    *    determined. This context carries information about the current state
+    *    of the UI, including any enclosing ports.
+    *
+    * @return
+    *    The rectangular bounds defined by the innermost port affecting the
+    *    given context, or the view bounds if no such port exists.
+    */
+   rect get_port_bounds(context const& ctx)
+   {
+      if (auto pctx = find_parent_context<port_base*>(ctx))
+         return pctx->bounds;
+      return ctx.view_bounds();
+   }
+
    view_limits port_element::limits(basic_context const& ctx) const
    {
       view_limits e_limits = subject().limits(ctx);
-      return {{ min_port_size, min_port_size }, e_limits.max };
+      return {{min_port_size, min_port_size}, e_limits.max};
    }
 
    void port_element::prepare_subject(context& ctx)
@@ -49,20 +72,17 @@ namespace cycfi { namespace elements
       subject().layout(ctx);
    }
 
-   ////////////////////////////////////////////////////////////////////////////
-   // vport_element class implementation
-   ////////////////////////////////////////////////////////////////////////////
    view_limits vport_element::limits(basic_context const& ctx) const
    {
       view_limits e_limits = subject().limits(ctx);
-      return {{ e_limits.min.x, min_port_size }, e_limits.max };
+      return {{e_limits.min.x, min_port_size}, e_limits.max};
    }
 
    void vport_element::prepare_subject(context& ctx)
    {
-      view_limits    e_limits          = subject().limits(ctx);
-      double         elem_height       = e_limits.min.y;
-      double         available_height  = ctx.parent->bounds.height();
+      view_limits e_limits = subject().limits(ctx);
+      double elem_height = e_limits.min.y;
+      double available_height = ctx.parent->bounds.height();
 
       ctx.bounds.top -= (elem_height - available_height) * _valign;
       ctx.bounds.height(elem_height);
@@ -70,20 +90,17 @@ namespace cycfi { namespace elements
       subject().layout(ctx);
    }
 
-   ////////////////////////////////////////////////////////////////////////////
-   // hport_element class implementation
-   ////////////////////////////////////////////////////////////////////////////
    view_limits hport_element::limits(basic_context const& ctx) const
    {
       view_limits e_limits = subject().limits(ctx);
-      return {{ min_port_size, e_limits.min.y }, e_limits.max };
+      return {{min_port_size, e_limits.min.y}, e_limits.max};
    }
 
    void hport_element::prepare_subject(context& ctx)
    {
-      view_limits    e_limits          = subject().limits(ctx);
-      double         elem_width        = e_limits.min.x;
-      double         available_width   = ctx.parent->bounds.width();
+      view_limits e_limits = subject().limits(ctx);
+      double elem_width = e_limits.min.x;
+      double available_width = ctx.parent->bounds.width();
 
       ctx.bounds.left -= (elem_width - available_width) * _halign;
       ctx.bounds.width(elem_width);
@@ -91,9 +108,29 @@ namespace cycfi { namespace elements
       subject().layout(ctx);
    }
 
-   ////////////////////////////////////////////////////////////////////////////
-   // scrollable class implementation
-   ////////////////////////////////////////////////////////////////////////////
+   /**
+    * @brief
+    *    Finds the nearest scrollable context in the hierarchy.
+    *
+    *    This function traverses the context hierarchy starting from the
+    *    given context (`ctx_`), searching for the nearest parent (or the
+    *    context itself) that contains a scrollable element. It utilizes the
+    *    `find_element` function to locate a `scrollable` instance within the
+    *    current context's element.
+    *
+    *    If a scrollable element is found, a `scrollable_context` struct is
+    *    returned, containing pointers to both the context and the scrollable
+    *    element. If no scrollable element is found in the hierarchy, the
+    *    function returns a `scrollable_context` with null pointers.
+    *
+    * @param ctx_
+    *    The starting context for the search.
+    *
+    * @return
+    *    A `scrollable_context` struct with pointers to the found context and
+    *    scrollable element. If not found, both pointers in the struct will
+    *    be null.
+    */
    scrollable::scrollable_context scrollable::find(context const& ctx_)
    {
       auto const* ctx = &ctx_;
@@ -101,24 +138,22 @@ namespace cycfi { namespace elements
       {
          auto* sp = find_element<scrollable*>(ctx->element);
          if (sp)
-            return { ctx, sp };
+            return {ctx, sp};
          else
             ctx = ctx->parent;
       }
-      return { 0, 0 };
+      return {0, 0};
    }
 
    ////////////////////////////////////////////////////////////////////////////
    // scroller_base class implementation
    ////////////////////////////////////////////////////////////////////////////
-   float scroller_base::scrollbar_width = 10;
-
    namespace
    {
       void draw_scrollbar_fill(canvas& _canvas, rect r, color fill_color)
       {
          _canvas.begin_path();
-         _canvas.rect(r);
+         _canvas.add_rect(r);
          _canvas.fill_style(fill_color);
          _canvas.fill();
       }
@@ -130,10 +165,10 @@ namespace cycfi { namespace elements
       )
       {
          _canvas.begin_path();
-         _canvas.round_rect(b, radius);
+         _canvas.add_round_rect(b, radius);
          _canvas.fill_style(fill_color);
 
-         if (is_tracking || _canvas.hit_test(mp))
+         if (is_tracking || _canvas.point_in_path(mp))
             _canvas.fill_style(fill_color.opacity(0.8));
 
          _canvas.fill_preserve();
@@ -144,9 +179,25 @@ namespace cycfi { namespace elements
       }
    }
 
+   /**
+    * @brief
+    *    Draws the scrollbar for the scroller_base.
+    *
+    * @param ctx
+    *    The drawing context, containing the canvas and other relevant
+    *    drawing information.
+    *
+    * @param info
+    *    A `scrollbar_info` struct containing details about the scrollbar's
+    *    bounds, position, and extent.
+    *
+    * @param mp
+    *    The current mouse position.
+    */
    void scroller_base::draw_scroll_bar(context const& ctx, scrollbar_info const& info, point mp)
    {
       theme const& thm = get_theme();
+      auto state = ctx.canvas.new_state();
 
       float x = info.bounds.left;
       float y = info.bounds.top;
@@ -168,11 +219,30 @@ namespace cycfi { namespace elements
          y += info.pos * (info.bounds.height()-h);
       }
 
-      draw_scrollbar(ctx.canvas, rect{ x, y, x+w, y+h }, scroller_base::scrollbar_width / 3,
+      draw_scrollbar(ctx.canvas, rect{x, y, x+w, y+h}, thm.scrollbar_width / 3,
          thm.frame_color.opacity(0.5), thm.scrollbar_color.opacity(0.4), mp,
          _tracking == ((w > h)? tracking_h : tracking_v));
    }
 
+   /**
+    * @brief
+    *    Calculates the position and size of the scrollbar.
+    *
+    *    This function determines the position and size of the scrollbar
+    *    within the scroller_base, based on the current scrolling information
+    *    provided by `info`.
+    *
+    * @param ctx
+    *    The drawing context.
+    *
+    * @param info
+    *    A `scrollbar_info` struct containing details about the current
+    *    scroll state, including the bounds of the scroller_base, the
+    *    position of the scrollbar, and the total extent of the content.
+    *
+    * @return
+    *    A `rect` representing the position and size of the scrollbar.
+    */
    rect scroller_base::scroll_bar_position(context const& /* ctx */, scrollbar_info const& info)
    {
       float x = info.bounds.left;
@@ -192,63 +262,80 @@ namespace cycfi { namespace elements
          clamp_min(h, 20);
          y += info.pos * (info.bounds.height()-h);
       }
-      return rect{ x, y, x+w, y+h };
+      return rect{x, y, x+w, y+h};
    }
 
    view_limits scroller_base::limits(basic_context const& ctx) const
    {
+      // A scrolling axis needs no more than room for its scrollbar; with no
+      // scrollbars, it needs nothing: the content scrolls in any width.
       view_limits e_limits = subject().limits(ctx);
-      return view_limits{
-         { allow_hscroll() ? min_port_size : e_limits.min.x, allow_vscroll() ? min_port_size : e_limits.min.y },
-         { e_limits.max.x,                                   e_limits.max.y }
-      };
+      float const min_scroll = has_scrollbars() ? min_port_size : 0;
+      auto min_x = allow_hscroll() ? min_scroll : e_limits.min.x;
+      auto min_y = allow_vscroll() ? min_scroll : e_limits.min.y;
+      auto max_x = std::max(min_x, e_limits.max.x);
+      auto max_y = std::max(min_y, e_limits.max.y);
+      return view_limits{{min_x, min_y}, {max_x, max_y}};
    }
 
    void scroller_base::prepare_subject(context& ctx)
    {
-      view_limits    e_limits          = subject().limits(ctx);
+      view_limits e_limits = subject().limits(ctx);
 
       if (allow_vscroll())
       {
-         double      elem_height       = e_limits.min.y;
-         double      available_height  = ctx.parent->bounds.height();
+         double elem_height = e_limits.min.y;
+         double available_height = ctx.parent->bounds.height();
 
-         ctx.bounds.top -= (elem_height - available_height) * valign();
+         if (elem_height <= available_height)
+            valign(0.0);
+         else
+            ctx.bounds.top -= (elem_height - available_height) * valign();
          ctx.bounds.height(elem_height);
       }
 
       if (allow_hscroll())
       {
-         double      elem_width        = e_limits.min.x;
-         double      available_width   = ctx.parent->bounds.width();
+         double elem_width = e_limits.min.x;
+         double available_width = ctx.parent->bounds.width();
 
-         ctx.bounds.left -= (elem_width - available_width) * halign();
+         if (elem_width <= available_width)
+            halign(0.0);
+         else
+            ctx.bounds.left -= (elem_width - available_width) * halign();
          ctx.bounds.width(elem_width);
       }
       subject().layout(ctx);
    }
 
-   element* scroller_base::hit_test(context const& ctx, point p)
+   element* scroller_base::hit_test(context const& ctx, point p, bool leaf, bool control)
    {
-      return element::hit_test(ctx, p);
+      return element::hit_test(ctx, p, leaf, control);
    }
+
+   // Hide the scroll bar if the content size, multiplied by this threshold,
+   // is larger than the available size.
+   constexpr auto scroll_bar_visibility_threshold = 0.99;
 
    scroller_base::scrollbar_bounds
    scroller_base::get_scrollbar_bounds(context const& ctx)
    {
       scrollbar_bounds r;
-      view_limits      e_limits = subject().limits(ctx);
+      view_limits e_limits = subject().limits(ctx);
+      theme const& thm = get_theme();
 
-      r.has_h = e_limits.min.x > ctx.bounds.width() && allow_hscroll();
-      r.has_v = e_limits.min.y > ctx.bounds.height() && allow_vscroll();
+      r.has_h = allow_hscroll() &&
+         e_limits.min.x * scroll_bar_visibility_threshold >= ctx.bounds.width();
+      r.has_v = allow_vscroll() &&
+         e_limits.min.y * scroll_bar_visibility_threshold >= ctx.bounds.height();
 
       if (r.has_v)
       {
          r.vscroll_bounds = rect{
-                 ctx.bounds.left + ctx.bounds.width() - scrollbar_width,
+            ctx.bounds.left + ctx.bounds.width() - thm.scrollbar_width,
             ctx.bounds.top,
             ctx.bounds.right,
-            ctx.bounds.bottom - (r.has_h ? scroller_base::scrollbar_width : 0)
+            ctx.bounds.bottom - (r.has_h ? thm.scrollbar_width : 0)
          };
       }
       else
@@ -260,8 +347,8 @@ namespace cycfi { namespace elements
       {
          r.hscroll_bounds = rect{
             ctx.bounds.left,
-            ctx.bounds.top + ctx.bounds.height() - scroller_base::scrollbar_width,
-            ctx.bounds.right - (r.has_v ? scroller_base::scrollbar_width : 0),
+            ctx.bounds.top + ctx.bounds.height() - thm.scrollbar_width,
+            ctx.bounds.right - (r.has_v ? thm.scrollbar_width : 0),
             ctx.bounds.bottom
          };
       }
@@ -278,26 +365,30 @@ namespace cycfi { namespace elements
 
       if (has_scrollbars())
       {
-         scrollbar_bounds  sb = get_scrollbar_bounds(ctx);
-         view_limits       e_limits = subject().limits(ctx);
-         point             mp = ctx.cursor_pos();
+         scrollbar_bounds sb = get_scrollbar_bounds(ctx);
+         view_limits e_limits = subject().limits(ctx);
+         point mp = ctx.cursor_pos();
 
          if (sb.has_v)
-            draw_scroll_bar(ctx, { valign(), e_limits.min.y, sb.vscroll_bounds }, mp);
+            draw_scroll_bar(ctx, {valign(), e_limits.min.y, sb.vscroll_bounds}, mp);
 
          if (sb.has_h)
-            draw_scroll_bar(ctx, { halign(), e_limits.min.x, sb.hscroll_bounds }, mp);
+            draw_scroll_bar(ctx, {halign(), e_limits.min.x, sb.hscroll_bounds}, mp);
       }
    }
 
-   bool scroller_base::scroll(context const& ctx, point dir, point /* p */)
+   bool scroller_base::scroll(context const& ctx, point dir, point p)
    {
       view_limits e_limits = subject().limits(ctx);
       bool redraw = false;
 
-      if (allow_hscroll())
+      // Only content larger than the port scrolls.
+      double const overflow_x = e_limits.min.x - ctx.bounds.width();
+      double const overflow_y = e_limits.min.y - ctx.bounds.height();
+
+      if (allow_hscroll() && overflow_x > 0)
       {
-         double dx = (-dir.x / (e_limits.min.x - ctx.bounds.width()));
+         double dx = -dir.x / overflow_x;
          if ((dx > 0 && halign() < 1.0) || (dx < 0 && halign() > 0.0))
          {
             double alx = halign() + dx;
@@ -307,9 +398,9 @@ namespace cycfi { namespace elements
          }
       }
 
-      if (allow_vscroll())
+      if (allow_vscroll() && overflow_y > 0)
       {
-         double dy = (-dir.y / (e_limits.min.y - ctx.bounds.height()));
+         double dy = -dir.y / overflow_y;
          if ((dy > 0 && valign() < 1.0) || (dy < 0 && valign() > 0.0))
          {
             double aly = valign() + dy;
@@ -320,8 +411,40 @@ namespace cycfi { namespace elements
       }
 
       if (redraw)
+      {
+         on_scroll(point(halign(), valign()));
          ctx.view.refresh(ctx);
-      return redraw;
+      }
+      return port_element::scroll(ctx, dir, p) || redraw;
+   }
+
+   /**
+    * @brief
+    *    Sets the scroll alignment of the scroller_base.
+    *
+    *    This function adjusts the scroll alignment of the scroller_base
+    *    object based on the specified point `p`, considering horizontal and
+    *    vertical scrolling capabilities, and adjusts the scroll alignment
+    *    accordingly.
+    *
+    *    If horizontal scrolling is allowed (`allow_hscroll()` returns true),
+    *    it sets the horizontal alignment (scroll alignment) to the
+    *    x-coordinate of the point `p`. Similarly, if vertical scrolling is
+    *    allowed (`allow_vscroll()` returns true), it sets the vertical
+    *    alignment (scroll alignment) to the y-coordinate of the point `p`.
+    *
+    *    Take note that alignment values are clamped to the range [0.0, 1.0].
+    *
+    * @param p
+    *    The point representing the new scroll alignment, where `p.x` is the
+    *    new horizontal alignment and `p.y` is the new vertical alignment.
+    */
+   void scroller_base::set_alignment(point p)
+   {
+      if (allow_hscroll())
+         halign(p.x);
+      if (allow_vscroll())
+         valign(p.y);
    }
 
    bool scroller_base::click(context const& ctx, mouse_button btn)
@@ -359,6 +482,7 @@ namespace cycfi { namespace elements
       {
          clamp(align, 0.0, 1.0);
          valign(align);
+         on_scroll(point(halign(), align));
          ctx.view.refresh(ctx);
       };
 
@@ -366,6 +490,7 @@ namespace cycfi { namespace elements
       {
          clamp(align, 0.0, 1.0);
          halign(align);
+         on_scroll(point(align, valign()));
          ctx.view.refresh(ctx);
       };
 
@@ -373,14 +498,14 @@ namespace cycfi { namespace elements
       {
          // vertical scroll
          rect b = scroll_bar_position(
-            ctx, { valign(), e_limits.min.y, sb.vscroll_bounds });
+            ctx, {valign(), e_limits.min.y, sb.vscroll_bounds});
 
          if (_tracking == start)
          {
             if (b.includes(p))
             {
                // start tracking scroll-box
-               _offset = point{ p.x-b.left, p.y-b.top };
+               _offset = point{p.x-b.left, p.y-b.top};
                _tracking = tracking_v;
             }
             else if (sb.vscroll_bounds.includes(p))
@@ -404,7 +529,8 @@ namespace cycfi { namespace elements
          if (_tracking == tracking_v)
          {
             p.y -= _offset.y + ctx.bounds.top;
-            valign_(p.y / (sb.vscroll_bounds.height() - b.height()));
+            if (auto room = sb.vscroll_bounds.height() - b.height(); room > 0)
+               valign_(p.y / room);
             return true;
          }
       }
@@ -413,28 +539,28 @@ namespace cycfi { namespace elements
       {
          // horizontal scroll
          rect b = scroll_bar_position(
-            ctx, { halign(), e_limits.min.x, sb.hscroll_bounds });
+            ctx, {halign(), e_limits.min.x, sb.hscroll_bounds});
 
          if (_tracking == start)
          {
             // start tracking scroll-box
             if (b.includes(p))
             {
-               _offset = point{ p.x-b.left, p.y-b.top };
+               _offset = point{p.x-b.left, p.y-b.top};
                _tracking = tracking_h;
             }
             else if (sb.hscroll_bounds.includes(p))
             {
                // page left or right
-               double page = b.width() / sb.vscroll_bounds.width();
+               double page = b.width() / sb.hscroll_bounds.width();
                if (p.x < b.left)
                {
-                  halign_(valign() - page);
+                  halign_(halign() - page);
                   return true;
                }
                else if (p.x > b.right)
                {
-                  halign_(valign() + page);
+                  halign_(halign() + page);
                   return true;
                }
             }
@@ -444,7 +570,8 @@ namespace cycfi { namespace elements
          if (_tracking == tracking_h)
          {
             p.x -= _offset.x + ctx.bounds.left;
-            halign_(p.x / (sb.hscroll_bounds.width() - b.width()));
+            if (auto room = sb.hscroll_bounds.width() - b.width(); room > 0)
+               halign_(p.x / room);
             return true;
          }
       }
@@ -456,14 +583,20 @@ namespace cycfi { namespace elements
    {
       if (has_scrollbars())
       {
+         // A bar lights up under the pointer: redraw when the pointer is
+         // over one, or has just left it, and not otherwise.
          scrollbar_bounds sb = get_scrollbar_bounds(ctx);
-         if (sb.hscroll_bounds.includes(p) || sb.vscroll_bounds.includes(p))
-         {
+         bool const over = status != cursor_tracking::leaving &&
+            ((sb.has_h && sb.hscroll_bounds.includes(p)) ||
+             (sb.has_v && sb.vscroll_bounds.includes(p)));
+         if (over || _over_bar)
             ctx.view.refresh(ctx);
+         _over_bar = over;
+         if (over)
+         {
             set_cursor(cursor_type::arrow);
             return true;
          }
-         ctx.view.refresh(ctx);
       }
       return port_element::cursor(ctx, p, status);
    }
@@ -476,15 +609,16 @@ namespace cycfi { namespace elements
    bool scroller_base::scroll_into_view(context const& ctx, rect r)
    {
       rect bounds = ctx.bounds;
+      theme const& thm = get_theme();
 
       if (has_scrollbars())
       {
          scrollbar_bounds sb = get_scrollbar_bounds(ctx);
 
-         if (sb.has_h)
-            bounds.right -= scroller_base::scrollbar_width;
          if (sb.has_v)
-            bounds.bottom -= scroller_base::scrollbar_width;
+            bounds.right -= thm.scrollbar_width;   // the vertical bar is at the right
+         if (sb.has_h)
+            bounds.bottom -= thm.scrollbar_width;  // the horizontal bar, at the bottom
       }
 
       if (!bounds.includes(r))
@@ -519,11 +653,13 @@ namespace cycfi { namespace elements
       {
          clamp(align, 0.0, 1.0);
          valign(align);
+         on_scroll(point(halign(), align));
          ctx.view.refresh(ctx);
       };
 
       bool handled = proxy_base::key(ctx, k);
-      if (!handled && (k.action == key_action::press || k.action == key_action::repeat))
+      if (!handled && (k.action == key_action::press || k.action == key_action::repeat)
+         && get_scrollbar_bounds(ctx).has_v)
       {
          switch (k.key)
          {
@@ -543,7 +679,7 @@ namespace cycfi { namespace elements
                view_limits e_limits = subject().limits(ctx);
                scrollbar_bounds sb = get_scrollbar_bounds(ctx);
                rect b = scroll_bar_position(
-                  ctx, { valign(), e_limits.min.y, sb.vscroll_bounds });
+                  ctx, {valign(), e_limits.min.y, sb.vscroll_bounds});
                double page = b.height() / sb.vscroll_bounds.height();
                valign_(valign() + ((k.key == key_code::page_down) ? page : -page));
                handled = true;
@@ -551,9 +687,29 @@ namespace cycfi { namespace elements
             }
 
             default:
-                break;
+               break;
          }
       }
       return handled;
    }
-}}
+
+   std::string port_element::class_name() const
+   {
+      return "port";
+   }
+
+   std::string vport_element::class_name() const
+   {
+      return "vport";
+   }
+
+   std::string hport_element::class_name() const
+   {
+      return "hport";
+   }
+
+   std::string scroller_base::class_name() const
+   {
+      return "scroller";
+   }
+}

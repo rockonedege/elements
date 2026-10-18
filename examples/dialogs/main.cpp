@@ -1,5 +1,5 @@
 /*=============================================================================
-   Copyright (c) 2016-2020 Joel de Guzman
+   Copyright (c) 2016-2023 Joel de Guzman
 
    Distributed under the MIT License (https://opensource.org/licenses/MIT)
 =============================================================================*/
@@ -7,6 +7,7 @@
 
 using namespace cycfi::elements;
 using namespace std::chrono_literals;
+using cycfi::artist::rgba;
 
 // Main window background color
 auto constexpr bkd_color = rgba(35, 35, 37, 255);
@@ -24,11 +25,11 @@ auto dialog_content()
 
    return
       hsize(300, simple_heading(
-         margin({ 10, 10, 10, 10 },
+         margin({10, 10, 10, 10},
             vtile(
-               top_margin(10, align_left(check_box1)),
-               top_margin(10, align_left(check_box2)),
-               top_margin(10, align_left(check_box3))
+               margin_top(10, align_left(check_box1)),
+               margin_top(10, align_left(check_box2)),
+               margin_top(10, align_left(check_box3))
             )
          ),
          "The Thraxian Legacy",
@@ -57,7 +58,11 @@ auto make_dialog(view& _view, app& _app)
 
 int main(int argc, char* argv[])
 {
-   app _app(argc, argv, "Dialogs", "com.cycfi.dialogs");
+   app _app("Dialogs");
+
+   // Set up the fonts and search paths once, at startup, so the
+   // first window does not pay for it.
+   init_resources();
    window _win(_app.name());
    _win.on_close = [&_app]() { _app.stop(); };
 
@@ -65,10 +70,12 @@ int main(int argc, char* argv[])
 
    _view.content(
       {
-         make_dialog(_view, _app),
          share(background)
       }
    );
+
+   // Open the dialog box
+   open_popup(make_dialog(_view, _app), _view);
 
    _app.run();
    return 0;

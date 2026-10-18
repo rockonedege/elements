@@ -1,5 +1,5 @@
 /*=============================================================================
-   Copyright (c) 2016-2020 Joel de Guzman
+   Copyright (c) 2016-2023 Joel de Guzman
 
    Distributed under the MIT License (https://opensource.org/licenses/MIT)
 
@@ -29,7 +29,7 @@
 =============================================================================*/
 #include <elements/base_view.hpp>
 
-namespace cycfi { namespace elements
+namespace cycfi::elements
 {
    key_code translate_key(WPARAM wparam, LPARAM lparam)
    {
@@ -207,4 +207,4 @@ namespace cycfi { namespace elements
          case 0x04a:  return key_code::kp_subtract;
       }
    }
-}}
+}

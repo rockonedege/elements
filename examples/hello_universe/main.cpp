@@ -1,5 +1,5 @@
 /*=============================================================================
-   Copyright (c) 2016-2020 Joel de Guzman
+   Copyright (c) 2016-2023 Joel de Guzman
 
    Distributed under the MIT License (https://opensource.org/licenses/MIT)
 =============================================================================*/
@@ -9,14 +9,18 @@ using namespace cycfi::elements;
 
 int main(int argc, char* argv[])
 {
-   app _app(argc, argv, "Hello Universe", "com.cycfi.hello-universe");
+   app _app("Hello Universe");
+
+   // Set up the fonts and search paths once, at startup, so the
+   // first window does not pay for it.
+   init_resources();
    window _win(_app.name());
    _win.on_close = [&_app]() { _app.stop(); };
 
    view view_(_win);
 
    view_.content(
-      scroller(image{ "space.jpg" })
+      scroller(image{"space.jpg"})
    );
 
    _app.run();

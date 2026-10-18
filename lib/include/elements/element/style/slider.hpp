@@ -1,0 +1,611 @@
+/*=============================================================================
+   Copyright (c) 2016-2023 Joel de Guzman
+
+   Distributed under the MIT License [ https://opensource.org/licenses/MIT ]
+=============================================================================*/
+#if !defined(ELEMENTS_STYLE_SLIDER_AUGUST_29_2016)
+#define ELEMENTS_STYLE_SLIDER_AUGUST_29_2016
+
+#include <elements/element/slider.hpp>
+#include <elements/element/style/grid_lines.hpp>
+#include <elements/element/style/track.hpp>
+
+namespace cycfi::elements
+{
+   ////////////////////////////////////////////////////////////////////////////
+   // The color of a thumb's indicator: the theme's, read when drawn, or one
+   // given (fixed_color, track.hpp). A thumb takes it as an empty base when
+   // it is the theme's, so the default costs nothing to hold.
+   ////////////////////////////////////////////////////////////////////////////
+   struct theme_indicator
+   {
+      color operator()() const { return get_theme().indicator_color.level(1.5); }
+   };
+
+   ////////////////////////////////////////////////////////////////////////////
+   // Basic Thumb (You can use this as the slider's thumb)
+   ////////////////////////////////////////////////////////////////////////////
+   template <unsigned _size, typename Indicator = theme_indicator>
+   class basic_thumb_styler : Indicator, public element
+   {
+   public:
+
+      static unsigned const size = _size;
+
+                              basic_thumb_styler(color c = colors::black)
+                               : _color(c)
+                              {}
+
+                              basic_thumb_styler(color c, Indicator indicator)
+                               : Indicator(indicator)
+                               , _color(c)
+                              {}
+
+      view_limits             limits(basic_context const& ctx) const override;
+      void                    draw(context const& ctx) override;
+      std::string             class_name() const override { return "thumb"; }
+
+      basic_thumb_styler<_size, fixed_color>
+                              indicator_color(color c) const
+                              { return {_color, fixed_color{c}}; }
+
+   private:
+
+      color                   _color;
+   };
+
+   template <unsigned size, typename Indicator>
+   inline view_limits basic_thumb_styler<size, Indicator>
+      ::limits(basic_context const& /* ctx */) const
+   {
+	  auto pt = point{float(size), float(size)};
+	  return view_limits{pt, pt};
+   }
+
+   template <unsigned size, typename Indicator>
+   inline void basic_thumb_styler<size, Indicator>::draw(context const& ctx)
+   {
+      auto& thm = get_theme();
+      auto& cnv = ctx.canvas;
+      auto  indicator_color = static_cast<Indicator const&>(*this)();
+      auto  cp = circle{center_point(ctx.bounds), size/2.0f};
+
+      draw_thumb(cnv, cp, _color, indicator_color);
+   }
+
+   template <unsigned size>
+   inline basic_thumb_styler<size> basic_thumb(color c = colors::black)
+   {
+      return {c};
+   }
+
+
+   ////////////////////////////////////////////////////////////////////////////
+   // Basic Rect Thumb: basic_thumb's shape changed and nothing else. A
+   // round rect of its own width and height, with the same body, the same
+   // highlight and the same indicator inside it, so a panel may mix the
+   // two without them looking like they came from different places.
+   ////////////////////////////////////////////////////////////////////////////
+   template <unsigned _width, unsigned _height, unsigned _radius = 4
+    , typename Indicator = theme_indicator>
+   class basic_rect_thumb_styler : Indicator, public element
+   {
+   public:
+
+      static unsigned const width = _width;
+      static unsigned const height = _height;
+      static unsigned const radius = _radius;
+
+                              basic_rect_thumb_styler(
+                                 color c = colors::black)
+                               : _color(c)
+                              {}
+
+                              basic_rect_thumb_styler(color c, Indicator indicator)
+                               : Indicator(indicator)
+                               , _color(c)
+                              {}
+
+      view_limits             limits(basic_context const& ctx) const override;
+      void                    draw(context const& ctx) override;
+      std::string             class_name() const override { return "thumb"; }
+
+      basic_rect_thumb_styler<_width, _height, _radius, fixed_color>
+                              indicator_color(color c) const
+                              { return {_color, fixed_color{c}}; }
+
+   private:
+
+      color                   _color;
+   };
+
+   template <unsigned width, unsigned height, unsigned radius, typename Indicator>
+   inline view_limits basic_rect_thumb_styler<width, height, radius, Indicator>
+      ::limits(basic_context const& /* ctx */) const
+   {
+      auto pt = point{float(width), float(height)};
+      return view_limits{pt, pt};
+   }
+
+   template <unsigned width, unsigned height, unsigned radius, typename Indicator>
+   inline void basic_rect_thumb_styler<width, height, radius, Indicator>
+      ::draw(context const& ctx)
+   {
+      auto& thm = get_theme();
+      auto& cnv = ctx.canvas;
+      auto  indicator_color = static_cast<Indicator const&>(*this)();
+      auto  c = center_point(ctx.bounds);
+      auto  bounds = rect{
+         c.x - (width/2.0f), c.y - (height/2.0f)
+       , c.x + (width/2.0f), c.y + (height/2.0f)};
+
+      draw_rect_thumb(cnv, bounds, float(radius), _color, indicator_color);
+   }
+
+   template <unsigned width, unsigned height, unsigned radius = 4>
+   inline basic_rect_thumb_styler<width, height, radius>
+   basic_rect_thumb(color c = colors::black)
+   {
+      return {c};
+   }
+
+
+   ////////////////////////////////////////////////////////////////////////////
+   // Basic Triangular Thumb: a pointer, for a selector pointing at its
+   // marks. `dir` is where the point goes.
+   ////////////////////////////////////////////////////////////////////////////
+   template <unsigned _size, direction _dir, typename Indicator = theme_indicator>
+   class basic_tri_thumb_styler : Indicator, public element
+   {
+   public:
+
+      static constexpr unsigned  size = _size;
+      static constexpr direction dir = _dir;
+
+                              basic_tri_thumb_styler(
+                                 color c = colors::black)
+                               : _color(c)
+                              {}
+
+                              basic_tri_thumb_styler(color c, Indicator indicator)
+                               : Indicator(indicator)
+                               , _color(c)
+                              {}
+
+      view_limits             limits(basic_context const& ctx) const override;
+      void                    draw(context const& ctx) override;
+      std::string             class_name() const override { return "thumb"; }
+
+      basic_tri_thumb_styler<_size, _dir, fixed_color>
+                              indicator_color(color c) const
+                              { return {_color, fixed_color{c}}; }
+
+   private:
+
+      color                   _color;
+   };
+
+   template <unsigned size, direction dir, typename Indicator>
+   inline view_limits basic_tri_thumb_styler<size, dir, Indicator>
+      ::limits(basic_context const& /* ctx */) const
+   {
+      auto pt = point{float(size), float(size)};
+      return view_limits{pt, pt};
+   }
+
+   template <unsigned size, direction dir, typename Indicator>
+   inline void basic_tri_thumb_styler<size, dir, Indicator>
+      ::draw(context const& ctx)
+   {
+      auto& cnv = ctx.canvas;
+      auto  indicator_color = static_cast<Indicator const&>(*this)();
+      auto  c = center_point(ctx.bounds);
+      auto  bounds = rect{
+         c.x - (size/2.0f), c.y - (size/2.0f)
+       , c.x + (size/2.0f), c.y + (size/2.0f)};
+
+      draw_tri_thumb(cnv, bounds, dir, _color, indicator_color);
+   }
+
+   template <unsigned size, direction dir = direction::up>
+   inline basic_tri_thumb_styler<size, dir>
+   basic_tri_thumb(color c = colors::black)
+   {
+      return {c};
+   }
+
+
+   ////////////////////////////////////////////////////////////////////////////
+   // Slider Element Base (common base class for slider elements)
+   ////////////////////////////////////////////////////////////////////////////
+   template <int _size, concepts::Element Subject>
+   class slider_styler_base : public proxy<Subject>
+   {
+   public:
+
+      static unsigned const size = _size;
+      using base_type = proxy<Subject>;
+      using base_type::base_type;
+
+      view_limits             limits(basic_context const& ctx) const override;
+      void                    prepare_subject(context& ctx) override;
+      std::string             class_name() const override { return "slider_styler"; }
+   };
+
+   template <int size, concepts::Element Subject>
+   inline view_limits
+   slider_styler_base<size, Subject>::limits(basic_context const& ctx) const
+   {
+      auto sl = this->subject().limits(ctx);
+      if (sl.min.x < sl.min.y) // is vertical?
+      {
+         sl.min.x += size;
+         sl.max.x += size;
+         clamp_max(sl.max.x, full_extent);
+      }
+      else
+      {
+         sl.min.y += size;
+         sl.max.y += size;
+         clamp_max(sl.max.y, full_extent);
+      }
+      return sl;
+   }
+
+   template <int size, concepts::Element Subject>
+   inline void
+   slider_styler_base<size, Subject>::prepare_subject(context& ctx)
+   {
+      if (ctx.bounds.width() < ctx.bounds.height()) // is vertical?
+      {
+         ctx.bounds.left += size/2;
+         ctx.bounds.right -= size/2;
+      }
+      else
+      {
+         ctx.bounds.top += size/2;
+         ctx.bounds.bottom -= size/2;
+      }
+   }
+
+   ////////////////////////////////////////////////////////////////////////////
+   // Slider Marks (You can use this to place tick marks on slider)
+   ////////////////////////////////////////////////////////////////////////////
+
+   ////////////////////////////////////////////////////////////////////////////
+   // deprecated
+   ////////////////////////////////////////////////////////////////////////////
+   template <
+      std::size_t _size, std::size_t _num_divs
+    , std::size_t _major_divs, concepts::Element Subject>
+   class slider_marks_styler : public slider_styler_base<_size, Subject>
+   {
+   public:
+
+      static_assert(_major_divs > 0, "Major divisions must be greater than zero");
+
+      using base_type = slider_styler_base<_size, Subject>;
+      using base_type::base_type;
+
+      void                    draw(context const& ctx) override;
+   };
+
+   void draw_slider_marks(
+      canvas& cnv, rect bounds, float size, std::size_t major_divs
+    , std::size_t minor_divs, color c);
+
+   template <
+      std::size_t _size, std::size_t _num_divs
+    , std::size_t _major_divs, concepts::Element Subject>
+   inline void
+   slider_marks_styler<_size, _num_divs, _major_divs, Subject>
+      ::draw(context const& ctx)
+   {
+      // Draw linear lines
+      draw_slider_marks(
+         ctx.canvas, ctx.bounds, _size, _num_divs
+       , _major_divs, colors::light_gray);
+
+      // Draw the subject
+      base_type::draw(ctx);
+   }
+
+   template <
+      std::size_t _size, std::size_t _num_divs = 50
+    , std::size_t _major_divs = 10, concepts::Element Subject>
+   [[deprecated("Use slider_marks_lin instead")]]
+   inline slider_marks_styler<_size, _num_divs, _major_divs, remove_cvref_t<Subject>>
+   slider_marks(Subject&& subject)
+   {
+      return {std::forward<Subject>(subject)};
+   }
+   ////////////////////////////////////////////////////////////////////////////
+
+   template <
+      std::size_t _size, std::size_t _major_divs
+    , std::size_t _minor_divs, concepts::Element Subject>
+   class slider_marks_lin_styler : public slider_styler_base<_size, Subject>
+   {
+   public:
+
+      static_assert(_major_divs > 0, "Major divisions must be greater than zero");
+
+      using base_type = slider_styler_base<_size, Subject>;
+      using base_type::base_type;
+
+      void                    draw(context const& ctx) override;
+   };
+
+   void draw_slider_marks_lin(
+      canvas& cnv, rect bounds, float size, std::size_t major_divs
+    , std::size_t minor_divs, color c);
+
+   template <
+      std::size_t _size, std::size_t _major_divs
+    , std::size_t _minor_divs, concepts::Element Subject>
+   inline void
+   slider_marks_lin_styler<_size, _major_divs, _minor_divs, Subject>
+      ::draw(context const& ctx)
+   {
+      // Draw linear lines
+      draw_slider_marks_lin(
+         ctx.canvas, ctx.bounds, _size, _major_divs
+       , _minor_divs, colors::light_gray);
+
+      // Draw the subject
+      base_type::draw(ctx);
+   }
+
+   template <
+      std::size_t _size, std::size_t _major_divs = 10
+    , std::size_t _minor_divs = 5, concepts::Element Subject>
+   inline slider_marks_lin_styler<_size, _major_divs, _minor_divs, remove_cvref_t<Subject>>
+   slider_marks_lin(Subject&& subject)
+   {
+      return {std::forward<Subject>(subject)};
+   }
+
+   template <
+      std::size_t _size, std::size_t _major_divs
+    , std::size_t _minor_divs, concepts::Element Subject>
+   class slider_marks_log_element : public slider_styler_base<_size, Subject>
+   {
+
+   public:
+
+      static_assert(_major_divs > 0, "Major divisions must be greater than zero");
+
+      using base_type = slider_styler_base<_size, Subject>;
+      using base_type::base_type;
+
+      void                    draw(context const& ctx) override;
+   };
+
+   void draw_slider_marks_log(
+      canvas& cnv, rect bounds, float size, std::size_t major_divs
+    , std::size_t minor_divs, color c);
+
+   template <
+      std::size_t _size, std::size_t _major_divs
+      , std::size_t _minor_divs, concepts::Element Subject>
+   inline void
+   slider_marks_log_element<_size, _major_divs, _minor_divs, Subject>
+      ::draw(context const& ctx)
+   {
+      // Draw logarithmic lines
+      draw_slider_marks_log(
+         ctx.canvas, ctx.bounds, _size, _major_divs
+         , _minor_divs, colors::light_gray);
+
+      // Draw the subject
+      base_type::draw(ctx);
+   }
+
+   template <
+      std::size_t _size, std::size_t _major_divs = 5
+      , std::size_t _minor_divs = 10, concepts::Element Subject>
+   inline slider_marks_log_element<_size, _major_divs, _minor_divs, remove_cvref_t<Subject>>
+   slider_marks_log(Subject&& subject)
+   {
+      return {std::forward<Subject>(subject)};
+   }
+
+   /** \class slider_marks_db_element
+    *
+    * \brief
+    *    A fader's ticks on a decibel scale: major at the marks a console
+    *    is ticked at, minor halfway between, placed through the `db_scale`
+    *    taper so they line up with a control on the same scale. Make one
+    *    with `slider_marks_db`. See grid_lines.hpp for the marks and the
+    *    taper.
+    *
+    * \tparam _size
+    *    The length of a major tick, in pixels. Minor ticks are shorter.
+    */
+   template <std::size_t _size, concepts::Element Subject>
+   class slider_marks_db_element : public slider_styler_base<_size, Subject>
+   {
+   public:
+
+      using base_type = slider_styler_base<_size, Subject>;
+
+                              slider_marks_db_element(
+                                 Subject subject, db_scale scale
+                              )
+                               : base_type(std::move(subject))
+                               , _scale(scale)
+                              {}
+
+      void                    draw(context const& ctx) override;
+
+   private:
+
+      db_scale                _scale;
+   };
+
+   void draw_slider_marks_db(
+      canvas& cnv, rect bounds, float size, db_scale const& scale, color c);
+
+   template <std::size_t _size, concepts::Element Subject>
+   inline void
+   slider_marks_db_element<_size, Subject>::draw(context const& ctx)
+   {
+      draw_slider_marks_db(
+         ctx.canvas, ctx.bounds, _size, _scale, colors::light_gray);
+
+      // Draw the subject
+      base_type::draw(ctx);
+   }
+
+   /**
+    * \brief
+    *    Put a fader's decibel ticks behind a slider.
+    *
+    * \param subject
+    *    The slider's track, which the ticks are drawn behind.
+    *
+    * \param scale
+    *    The decibel scale, which should be the one the slider is read
+    *    with.
+    */
+   template <std::size_t _size, concepts::Element Subject>
+   inline slider_marks_db_element<_size, remove_cvref_t<Subject>>
+   slider_marks_db(Subject&& subject, db_scale scale = {})
+   {
+      return {std::forward<Subject>(subject), scale};
+   }
+
+   /** \class slider_labels_db_element
+    *
+    * \brief
+    *    A fader's labels on a decibel scale, written at the marks: the
+    *    magnitude without a sign, and the infinity sign at the bottom when
+    *    the scale reaches silence. Make one with `slider_labels_db`.
+    *
+    * \tparam _size
+    *    How far the labels sit from the track, in pixels. A negative size
+    *    puts them on the other side, as with `slider_labels`.
+    */
+   template <int _size, concepts::Element Subject>
+   class slider_labels_db_element
+    : public slider_styler_base<abs(_size), Subject>
+   {
+   public:
+
+      using base_type = slider_styler_base<abs(_size), Subject>;
+
+                              slider_labels_db_element(
+                                 Subject subject, float font_size
+                               , db_scale scale
+                              )
+                               : base_type(std::move(subject))
+                               , _font_size(font_size)
+                               , _scale(scale)
+                              {}
+
+      void                    draw(context const& ctx) override;
+
+   private:
+
+      float                   _font_size;
+      db_scale                _scale;
+   };
+
+   void draw_slider_labels_db(
+      canvas& cnv, rect bounds, float size, float font_size
+    , db_scale const& scale);
+
+   template <int size, concepts::Element Subject>
+   inline void
+   slider_labels_db_element<size, Subject>::draw(context const& ctx)
+   {
+      // Draw the subject
+      base_type::draw(ctx);
+
+      // Draw the labels
+      draw_slider_labels_db(
+         ctx.canvas, ctx.bounds, size, _font_size, _scale);
+   }
+
+   /**
+    * \brief
+    *    Put a fader's decibel labels beside a slider.
+    *
+    * \param subject
+    *    The slider, or its ticks, which the labels are written beside.
+    *
+    * \param font_size
+    *    The label font size, relative to the theme's.
+    *
+    * \param scale
+    *    The decibel scale, which should be the one the slider is read
+    *    with.
+    */
+   template <int size, concepts::Element Subject>
+   inline slider_labels_db_element<size, remove_cvref_t<Subject>>
+   slider_labels_db(Subject&& subject, float font_size, db_scale scale = {})
+   {
+      return {std::forward<Subject>(subject), font_size, scale};
+   }
+
+   ////////////////////////////////////////////////////////////////////////////
+   // Slider Labels (You can use this to place slider labels with sliders)
+   ////////////////////////////////////////////////////////////////////////////
+   template <int _size, concepts::Element Subject, std::size_t num_labels>
+   class slider_labels_styler
+    : public slider_styler_base<abs(_size), Subject>
+   {
+   public:
+
+      constexpr static int const size = _size;
+      using base_type = slider_styler_base<abs(_size), Subject>;
+      using string_array = std::array<std::string, num_labels>;
+
+                              slider_labels_styler(
+                                 Subject subject
+                               , float font_size
+                              )
+                               : base_type(std::move(subject))
+                               , _font_size(font_size)
+                              {}
+
+      void                    draw(context const& ctx) override;
+
+      string_array            _labels;
+      float                   _font_size;
+   };
+
+   void draw_slider_labels(
+      canvas& cnv
+    , rect bounds
+    , float size
+    , float font_size
+    , std::string const labels[]
+    , std::size_t _num_labels
+   );
+
+   template <int size, concepts::Element Subject, std::size_t num_labels>
+   inline void
+   slider_labels_styler<size, Subject, num_labels>::draw(context const& ctx)
+   {
+      // Draw the subject
+      base_type::draw(ctx);
+
+      // Draw the labels
+      draw_slider_labels(
+         ctx.canvas, ctx.bounds, size
+       , _font_size, _labels.data(), num_labels);
+   }
+
+   template <int size, concepts::Element Subject, typename... S>
+   inline slider_labels_styler<size, remove_cvref_t<Subject>, sizeof...(S)>
+   slider_labels(Subject&& subject, float font_size, S&&... s)
+   {
+      auto r = slider_labels_styler<size, remove_cvref_t<Subject>, sizeof...(S)>
+         {std::forward<Subject>(subject), font_size};
+      r._labels = {{std::move(s)...}};
+      return r;
+   }
+}
+
+#endif

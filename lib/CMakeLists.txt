@@ -1,56 +1,124 @@
 ###############################################################################
-#  Copyright (c) 2016-2020 Joel de Guzman
+#  Copyright (c) 2016-2024 Joel de Guzman
 #  Copyright (c) 2020 Michał Urbański
 #
 #  Distributed under the MIT License (https://opensource.org/licenses/MIT)
 ###############################################################################
-cmake_minimum_required(VERSION 3.7.2...3.15.0)
+cmake_minimum_required(VERSION 3.16.0)
+
+include(FetchContent)
+
+###############################################################################
+# Artist library
+
+set(ARTIST_BUILD_EXAMPLES OFF CACHE BOOL "Artist build examples")
+set(ARTIST_BUILD_TESTS OFF CACHE BOOL "Artist build tests")
+
+# With no backend chosen, here or directly on Artist, use the platform's
+# native one: Direct2D on Windows, Quartz 2D on macOS, Cairo elsewhere.
+if (NOT (ELEMENTS_DIRECT2D OR ELEMENTS_RECORDING OR ELEMENTS_CAIRO
+      OR ELEMENTS_QUARTZ_2D OR ELEMENTS_SKIA OR ARTIST_DIRECT2D
+      OR ARTIST_RECORDING OR ARTIST_CAIRO OR ARTIST_QUARTZ_2D OR ARTIST_SKIA))
+   if (WIN32)
+      set(ELEMENTS_DIRECT2D ON)
+   elseif (APPLE)
+      set(ELEMENTS_QUARTZ_2D ON)
+   else()
+      set(ELEMENTS_CAIRO ON)
+   endif()
+endif()
+
+if (ELEMENTS_DIRECT2D)
+   if (NOT WIN32)
+      message(FATAL_ERROR "ELEMENTS_DIRECT2D=ON is Windows only")
+   endif()
+   if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/artist/lib/impl/windows/direct2d/canvas.cpp")
+      message(FATAL_ERROR
+         "ELEMENTS_DIRECT2D=ON requires a Direct2D-capable Artist checkout. "
+         "Update lib/artist to develop (or newer).")
+   endif()
+   set(ARTIST_DIRECT2D ON CACHE BOOL "Artist graphics backend option")
+   set(ARTIST_SKIA OFF CACHE BOOL "Artist graphics backend option")
+   set(ARTIST_CAIRO OFF CACHE BOOL "Artist graphics backend option")
+   set(ARTIST_QUARTZ_2D OFF CACHE BOOL "Artist graphics backend option")
+elseif (ELEMENTS_RECORDING)
+   # Draws nothing: records a journal of what was drawn. For tests, with the
+   # headless host.
+   set(ARTIST_RECORDING ON CACHE BOOL "Artist graphics backend option")
+elseif (ELEMENTS_CAIRO)
+   if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/artist/lib/impl/cairo/canvas.cpp")
+      message(FATAL_ERROR
+         "ELEMENTS_CAIRO=ON requires a Cairo-capable Artist checkout. "
+         "Update lib/artist to artist_2026_dev (or newer).")
+   endif()
+   set(ARTIST_CAIRO ON CACHE BOOL "Artist graphics backend option")
+   set(ARTIST_SKIA OFF CACHE BOOL "Artist graphics backend option")
+   set(ARTIST_QUARTZ_2D OFF CACHE BOOL "Artist graphics backend option")
+elseif (ELEMENTS_QUARTZ_2D)
+   set(ARTIST_QUARTZ_2D ON CACHE BOOL "Artist graphics backend option")
+elseif (ELEMENTS_SKIA)
+   set(ARTIST_SKIA ON CACHE BOOL "Artist graphics backend option")
+endif()
+
+add_subdirectory(artist)
 
 ###############################################################################
 # Sources (and Resources)
 
 set(ELEMENTS_SOURCES
+   src/app.cpp
    src/element/button.cpp
    src/element/child_window.cpp
    src/element/composite.cpp
+   src/element/curve_editor.cpp
+   src/element/swatch_grid.cpp
    src/element/dial.cpp
-   src/element/dynamic_list.cpp
+   src/element/drag_and_drop.cpp
    src/element/element.cpp
    src/element/floating.cpp
    src/element/flow.cpp
-   src/element/gallery/button.cpp
-   src/element/gallery/check_box.cpp
-   src/element/gallery/icon_button.cpp
-   src/element/gallery/menu.cpp
-   src/element/gallery/radio_button.cpp
-   src/element/gallery/tab.cpp
-   src/element/gallery/thumbwheel.cpp
    src/element/grid.cpp
    src/element/image.cpp
    src/element/label.cpp
    src/element/layer.cpp
+   src/element/list.cpp
    src/element/menu.cpp
-   src/element/misc.cpp
    src/element/popup.cpp
    src/element/port.cpp
-   src/element/progress_bar.cpp
    src/element/proxy.cpp
+   src/element/range_slider.cpp
+   src/element/selection.cpp
    src/element/slider.cpp
+   src/element/status_bar.cpp
+   src/element/style/border.cpp
+   src/element/style/button.cpp
+   src/element/style/check_box.cpp
+   src/element/style/curve_editor.cpp
+   src/element/style/swatches.cpp
+   src/element/style/grid_lines.cpp
+   src/element/style/icon_button.cpp
+   src/element/style/menu.cpp
+   src/element/style/misc.cpp
+   src/element/style/radio_button.cpp
+   src/element/style/slide_switch.cpp
+   src/element/style/slider.cpp
+   src/element/style/thumbwheel.cpp
    src/element/text.cpp
    src/element/thumbwheel.cpp
+   src/element/dock.cpp
+   src/element/split.cpp
    src/element/tile.cpp
    src/element/tooltip.cpp
-   src/support/canvas.cpp
    src/support/draw_utils.cpp
-   src/support/font.cpp
-   src/support/glyphs.cpp
-   src/support/pixmap.cpp
+   src/support/error_handler.cpp
+   src/support/log.cpp
+   src/support/trace.cpp
+   src/support/clipboard.cpp
+   src/support/payload.cpp
    src/support/receiver.cpp
-   src/support/rect.cpp
-   src/support/text_utils.cpp
-   src/support/resource_paths.cpp
    src/support/text_utils.cpp
    src/support/theme.cpp
+   src/support/perf.cpp
    src/view.cpp
 )
 
@@ -62,69 +130,87 @@ set(ELEMENTS_HEADERS
    include/elements/element/align.hpp
    include/elements/element/button.hpp
    include/elements/element/composite.hpp
+   include/elements/element/curve_editor.hpp
+   include/elements/element/image_grid.hpp
+   include/elements/element/swatches.hpp
+   include/elements/element/swatch_grid.hpp
    include/elements/element/dial.hpp
-   include/elements/element/dynamic_list.hpp
+   include/elements/element/drag_and_drop.hpp
    include/elements/element/element.hpp
+   include/elements/element/events_intercept.hpp
    include/elements/element/floating.hpp
    include/elements/element/flow.hpp
-   include/elements/element/gallery.hpp
-   include/elements/element/gallery/button.hpp
-   include/elements/element/gallery/caption.hpp
-   include/elements/element/gallery/check_box.hpp
-   include/elements/element/gallery/thumbwheel.hpp
-   include/elements/element/gallery/dialog.hpp
-   include/elements/element/gallery/group.hpp
-   include/elements/element/gallery/icon_button.hpp
-   include/elements/element/gallery/menu.hpp
-   include/elements/element/gallery/message_box.hpp
-   include/elements/element/gallery/notebook.hpp
-   include/elements/element/gallery/pane.hpp
-   include/elements/element/gallery/radio_button.hpp
-   include/elements/element/gallery/tab.hpp
-   include/elements/element/gallery/text_entry.hpp
    include/elements/element/grid.hpp
    include/elements/element/image.hpp
    include/elements/element/indirect.hpp
+   include/elements/element/hidable.hpp
    include/elements/element/label.hpp
    include/elements/element/layer.hpp
+   include/elements/element/list.hpp
    include/elements/element/margin.hpp
    include/elements/element/menu.hpp
-   include/elements/element/misc.hpp
+   include/elements/element/modal.hpp
    include/elements/element/popup.hpp
    include/elements/element/port.hpp
-   include/elements/element/progress_bar.hpp
    include/elements/element/proxy.hpp
-   include/elements/element/selectable.hpp
+   include/elements/element/range_slider.hpp
+   include/elements/element/selection.hpp
    include/elements/element/size.hpp
    include/elements/element/slider.hpp
+   include/elements/element/status_bar.hpp
+   include/elements/element/style.hpp
+   include/elements/element/style/border.hpp
+   include/elements/element/style/button.hpp
+   include/elements/element/style/caption.hpp
+   include/elements/element/style/check_box.hpp
+   include/elements/element/style/curve_editor.hpp
+   include/elements/element/style/image_grid.hpp
+   include/elements/element/style/swatches.hpp
+   include/elements/element/style/dialog.hpp
+   include/elements/element/style/grid_lines.hpp
+   include/elements/element/style/group.hpp
+   include/elements/element/style/icon_button.hpp
+   include/elements/element/style/menu.hpp
+   include/elements/element/style/message_box.hpp
+   include/elements/element/style/misc.hpp
+   include/elements/element/style/notebook.hpp
+   include/elements/element/style/pane.hpp
+   include/elements/element/style/radio_button.hpp
+   include/elements/element/style/tab.hpp
+   include/elements/element/style/text_entry.hpp
+   include/elements/element/style/thumbwheel.hpp
+   include/elements/element/style/tooltip.hpp
+   include/elements/element/style/track.hpp
+   include/elements/element/style/status_bar.hpp
    include/elements/element/text.hpp
    include/elements/element/thumbwheel.hpp
+   include/elements/element/dock.hpp
+   include/elements/element/split.hpp
    include/elements/element/tile.hpp
    include/elements/element/tracker.hpp
    include/elements/support.hpp
-   include/elements/support/canvas.hpp
-   include/elements/support/circle.hpp
-   include/elements/support/color.hpp
    include/elements/support/context.hpp
-   include/elements/support/detail/canvas_impl.hpp
-   include/elements/support/detail/scratch_context.hpp
-   include/elements/support/detail/stb_image.h
    include/elements/support/draw_utils.hpp
-   include/elements/support/font.hpp
-   include/elements/support/glyphs.hpp
+   include/elements/support/error_handler.hpp
    include/elements/support/icon_ids.hpp
-   include/elements/support/pixmap.hpp
-   include/elements/support/point.hpp
+   include/elements/support/log.hpp
+   include/elements/support/trace.hpp
    include/elements/support/receiver.hpp
-   include/elements/support/rect.hpp
-   include/elements/support/resource_paths.hpp
+   include/elements/support/text_reader_writer.hpp
    include/elements/support/text_utils.hpp
    include/elements/support/theme.hpp
+   include/elements/support/perf.hpp
    include/elements/view.hpp
    include/elements/window.hpp
 )
 
-if (APPLE)
+if (ELEMENTS_HOST_UI_LIBRARY STREQUAL "headless")
+   set(ELEMENTS_HOST
+      host/headless/app.cpp
+      host/headless/base_view.cpp
+      host/headless/window.cpp
+   )
+elseif (APPLE)
    set(ELEMENTS_HOST
       host/macos/app.mm
       host/macos/base_view.mm
@@ -133,10 +219,27 @@ if (APPLE)
    )
 elseif (ELEMENTS_HOST_UI_LIBRARY STREQUAL "gtk")
    set(ELEMENTS_HOST
-      host/linux/app.cpp
-      host/linux/base_view.cpp
-      host/linux/key.cpp
-      host/linux/window.cpp
+      host/gtk3/app.cpp
+      host/gtk3/base_view.cpp
+      host/gtk3/key.cpp
+      host/gtk3/window.cpp
+   )
+elseif (ELEMENTS_HOST_UI_LIBRARY STREQUAL "x11")
+   set(ELEMENTS_HOST
+      host/x11/app.cpp
+      host/x11/base_view.cpp
+      host/x11/key.cpp
+      host/x11/window.cpp
+   )
+elseif (ELEMENTS_HOST_UI_LIBRARY STREQUAL "wayland")
+   set(ELEMENTS_HOST
+      host/wayland/app.cpp
+      host/wayland/base_view.cpp
+      host/wayland/key.cpp
+      host/wayland/window.cpp
+      ${CMAKE_CURRENT_BINARY_DIR}/wayland-gen/fractional-scale-v1-protocol.c
+      ${CMAKE_CURRENT_BINARY_DIR}/wayland-gen/viewporter-protocol.c
+      ${CMAKE_CURRENT_BINARY_DIR}/wayland-gen/text-input-unstable-v3-protocol.c
    )
 elseif (WIN32)
    set(ELEMENTS_HOST
@@ -145,7 +248,31 @@ elseif (WIN32)
       host/windows/base_view.cpp
       host/windows/key.cpp
       host/windows/window.cpp
+      host/windows/drag_and_drop.cpp
+      host/windows/transfer.hpp
+      host/windows/transfer.cpp
    )
+endif()
+
+# The host layer carries the platform's view class, and on macOS its
+# Objective-C name has to be unique in the process, since the runtime keeps
+# one flat namespace for the whole of it. A library compiled once can only
+# give that class one name, which is fine for an application and not for a
+# plugin, which may sit in a host beside another Elements.
+#
+# With this on, the host layer stays out of the library and its paths are
+# published in ELEMENTS_HOST_SOURCES instead. A consumer compiles them into
+# each of its own binaries with its own ELEMENTS_CLASS_PREFIX. Nothing else
+# is needed: linking elements brings the include paths, the host UI
+# definition and the compile options along with it.
+option(ELEMENTS_HOST_IN_CONSUMER
+   "Leave the host layer out of the library for the consumer to compile" OFF)
+
+if (ELEMENTS_HOST_IN_CONSUMER)
+   list(TRANSFORM ELEMENTS_HOST PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
+   set(ELEMENTS_HOST_SOURCES ${ELEMENTS_HOST}
+      CACHE INTERNAL "The Elements host layer, for the consumer to compile")
+   set(ELEMENTS_HOST "")
 endif()
 
 source_group("Source Files\\elements"
@@ -163,8 +290,7 @@ source_group("Header Files\\elements"
    ${ELEMENTS_HEADERS}
 )
 
-add_subdirectory(infra)
-add_library(elements)
+add_library(elements STATIC)
 
 target_sources(elements
    PRIVATE ${ELEMENTS_SOURCES} ${ELEMENTS_HOST}
@@ -172,14 +298,21 @@ target_sources(elements
 )
 
 target_include_directories(elements PUBLIC include)
-target_link_libraries(elements PUBLIC cycfi::infra)
-target_compile_features(elements PUBLIC cxx_std_17)
+target_compile_features(elements PUBLIC cxx_std_20)
 
 if(ELEMENTS_ENABLE_LTO)
    set_target_properties(elements PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE)
 endif()
 
-if (NOT MSVC)
+###############################################################################
+# PkgConfig
+#
+# Only the GTK host needs it here, for fontconfig, freetype and GTK itself
+# below. Artist asks for it separately, where a backend needs it. So a
+# macOS build with the Cocoa host and Quartz2D, or a Windows one with the
+# Win32 host, requires no pkg-config at all.
+
+if (ELEMENTS_HOST_UI_LIBRARY STREQUAL "gtk")
    find_package(PkgConfig REQUIRED)
 endif()
 
@@ -193,9 +326,17 @@ target_compile_options(elements PRIVATE
    $<$<CXX_COMPILER_ID:MSVC>:/W4 /wd4244 /wd4305 /wd4996 /wd4267 /wd4018 /wd4456 /utf-8>
 )
 
+# quill's logging macros are variadic, and MSVC's traditional
+# preprocessor mis-splits their arguments, so the format arguments land in
+# the metadata constructor. support/log.hpp is a public header, so this is
+# needed by anything that logs, not by Elements alone.
+target_compile_options(elements PUBLIC
+   $<$<CXX_COMPILER_ID:MSVC>:/Zc:preprocessor>
+)
+
 if (MSVC)
    # Kinda silly to have to do this: https://bit.ly/2ZXjzzn
-   STRING(REGEX REPLACE "/W3" "/W4" CMAKE_CXX_FLAGS ${CMAKE_CXX_FLAGS})
+   STRING(REGEX REPLACE "/W3" "/W4" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
 endif()
 
 if (APPLE)
@@ -203,79 +344,33 @@ if (APPLE)
    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic -ftemplate-backtrace-limit=0")
 endif()
 
-if (APPLE)
-   set(lib_dir "/usr/local/opt")
+###############################################################################
+# Cycfi Infra
+
+# Artist's own infra, so both use one copy. A parent project that already
+# added infra keeps its own.
+if (NOT TARGET cycfi::infra)
+   add_subdirectory(artist/lib/infra infra)
 endif()
+target_link_libraries(elements PUBLIC cycfi::infra)
 
 ###############################################################################
-# Cairo
+# Fontconfig + Freetype, for the GTK host only. The Win32 host uses
+# DirectWrite and the macOS host uses CoreText, and the Cairo and Skia
+# backends bring their own through Artist. Linking them on macOS pulls in
+# Homebrew dylibs from /opt/homebrew, which App Sandboxed hosts such as
+# Logic Pro cannot load, so a plugin built with Elements fails to open.
 
-if (MSVC)
-   target_include_directories(elements PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/external/cairo/include)
-
-   if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-      target_link_libraries(elements PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/external/cairo/lib/x64/cairo.lib)
-   else()
-	  target_link_libraries(elements PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/external/cairo/lib/x86/cairo.lib)
-   endif()
-elseif (APPLE)
-	# TODO: add a min version specifiction
-	pkg_check_modules(cairo REQUIRED IMPORTED_TARGET cairo)
-   target_include_directories(elements PUBLIC ${cairo_INCLUDE_DIRS})
-   target_link_libraries(elements PUBLIC "${lib_dir}/cairo/lib/libcairo.a")            # Static link
-   target_link_libraries(elements PRIVATE "${lib_dir}/libpng/lib/libpng.a")            # Static link
-   target_link_libraries(elements PRIVATE "${lib_dir}/pixman/lib/libpixman-1.a")       # Static link
-   target_link_libraries(elements PRIVATE "${lib_dir}/zlib/lib/libz.a")                # Static link
-else()
-	# TODO: add a min version specifiction
-	pkg_check_modules(cairo REQUIRED IMPORTED_TARGET cairo)
-	target_link_libraries(elements PUBLIC PkgConfig::cairo)
-endif()
-
-###############################################################################
-# Fontconfig
-
-if (MSVC)
-   target_include_directories(elements PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/external/fontconfig/include)
-
-   if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-	  target_link_libraries(elements PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/external/fontconfig/x64/fontconfig.lib)
-   else()
-	  target_link_libraries(elements PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/external/fontconfig/x86/fontconfig.lib)
-   endif()
-elseif (APPLE)
-   pkg_check_modules(fontconfig REQUIRED IMPORTED_TARGET fontconfig)
-   target_include_directories(elements PUBLIC ${fontconfig_INCLUDE_DIRS})
-   target_link_libraries(elements PUBLIC "${lib_dir}/fontconfig/lib/libfontconfig.a")  # Static link
-   target_link_libraries(elements PUBLIC "${lib_dir}/expat/lib/libexpat.a")            # Static link
-else()
+if (ELEMENTS_HOST_UI_LIBRARY STREQUAL "gtk")
    pkg_check_modules(fontconfig REQUIRED IMPORTED_TARGET fontconfig)
    target_link_libraries(elements PUBLIC PkgConfig::fontconfig)
-endif()
 
-###############################################################################
-# Freetype
-
-if (MSVC)
-   target_include_directories(elements PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/external/freetype/include)
-
-   if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-	  target_link_libraries(elements PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/external/freetype/win64/freetype.lib)
-   else()
-	  target_link_libraries(elements PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/external/freetype/win32/freetype.lib)
-   endif()
-elseif (APPLE)
-   pkg_check_modules(freetype2 REQUIRED IMPORTED_TARGET freetype2)
-   target_include_directories(elements PUBLIC ${freetype2_INCLUDE_DIRS})
-   target_link_libraries(elements PUBLIC "${lib_dir}/freetype2/lib/libfreetype.a")     # Static link
-   target_link_libraries(elements PUBLIC "${lib_dir}/bzip2/lib/libbz2.a")              # Static link
-elseif (UNIX OR WIN32)
    pkg_check_modules(freetype2 REQUIRED IMPORTED_TARGET freetype2)
    target_link_libraries(elements PUBLIC PkgConfig::freetype2)
 endif()
 
 ###############################################################################
-# GTK (linux only)
+# GTK3
 
 if (ELEMENTS_HOST_UI_LIBRARY STREQUAL "gtk")
    pkg_check_modules(GTK3 REQUIRED IMPORTED_TARGET gtk+-3.0)
@@ -283,13 +378,106 @@ if (ELEMENTS_HOST_UI_LIBRARY STREQUAL "gtk")
 endif()
 
 ###############################################################################
+# X11 (native host, no GTK)
+
+if (ELEMENTS_HOST_UI_LIBRARY STREQUAL "x11")
+   find_package(PkgConfig REQUIRED)
+   pkg_check_modules(ELEM_X11 REQUIRED IMPORTED_TARGET x11)
+   pkg_check_modules(XCURSOR REQUIRED IMPORTED_TARGET xcursor)
+   pkg_check_modules(XRANDR REQUIRED IMPORTED_TARGET xrandr)
+   target_link_libraries(elements PRIVATE PkgConfig::ELEM_X11 PkgConfig::XCURSOR PkgConfig::XRANDR)
+   # dladdr, to find the resources beside a plugin's own module
+   target_link_libraries(elements PRIVATE ${CMAKE_DL_LIBS})
+   if (ELEMENTS_CAIRO)
+      pkg_check_modules(CAIRO_XLIB REQUIRED IMPORTED_TARGET cairo-xlib)
+      target_link_libraries(elements PRIVATE PkgConfig::CAIRO_XLIB)
+   else()
+      find_package(OpenGL REQUIRED COMPONENTS OpenGL)
+      pkg_check_modules(EGL REQUIRED IMPORTED_TARGET egl)
+      target_link_libraries(elements PRIVATE PkgConfig::EGL OpenGL::GL)
+   endif()
+endif()
+
+###############################################################################
+# Wayland (native host, libdecor decorations)
+
+if (ELEMENTS_HOST_UI_LIBRARY STREQUAL "wayland")
+   find_package(PkgConfig REQUIRED)
+   pkg_check_modules(WL_CLIENT REQUIRED IMPORTED_TARGET wayland-client)
+   pkg_check_modules(WL_CURSOR REQUIRED IMPORTED_TARGET wayland-cursor)
+   pkg_check_modules(LIBDECOR REQUIRED IMPORTED_TARGET libdecor-0)
+   pkg_check_modules(XKBCOMMON REQUIRED IMPORTED_TARGET xkbcommon)
+   target_link_libraries(elements PRIVATE
+      PkgConfig::WL_CLIENT PkgConfig::WL_CURSOR PkgConfig::LIBDECOR PkgConfig::XKBCOMMON)
+   if (ELEMENTS_CAIRO)
+      pkg_check_modules(CAIRO_PKG REQUIRED IMPORTED_TARGET cairo)
+      target_link_libraries(elements PRIVATE PkgConfig::CAIRO_PKG)
+   else()
+      find_package(OpenGL REQUIRED COMPONENTS OpenGL)
+      pkg_check_modules(EGL REQUIRED IMPORTED_TARGET egl)
+      pkg_check_modules(WL_EGL REQUIRED IMPORTED_TARGET wayland-egl)
+      target_link_libraries(elements PRIVATE PkgConfig::EGL PkgConfig::WL_EGL OpenGL::GL)
+   endif()
+
+   # Generate fractional-scale + viewporter protocol glue (for per-surface HiDPI).
+   find_program(WAYLAND_SCANNER wayland-scanner REQUIRED)
+   pkg_get_variable(WL_PROTOCOLS_DIR wayland-protocols pkgdatadir)
+   if (NOT WL_PROTOCOLS_DIR)
+      execute_process(COMMAND pkg-config --variable=pkgdatadir wayland-protocols
+         OUTPUT_VARIABLE WL_PROTOCOLS_DIR OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+   endif()
+   set(WL_GEN "${CMAKE_CURRENT_BINARY_DIR}/wayland-gen")
+   file(MAKE_DIRECTORY "${WL_GEN}")
+   foreach(spec
+      "fractional-scale-v1=${WL_PROTOCOLS_DIR}/staging/fractional-scale/fractional-scale-v1.xml"
+      "viewporter=${WL_PROTOCOLS_DIR}/stable/viewporter/viewporter.xml"
+      "text-input-unstable-v3=${WL_PROTOCOLS_DIR}/unstable/text-input/text-input-unstable-v3.xml")
+      string(REPLACE "=" ";" parts "${spec}")
+      list(GET parts 0 nm)
+      list(GET parts 1 xml)
+      add_custom_command(OUTPUT "${WL_GEN}/${nm}-client-protocol.h"
+         COMMAND "${WAYLAND_SCANNER}" client-header "${xml}" "${WL_GEN}/${nm}-client-protocol.h"
+         DEPENDS "${xml}")
+      add_custom_command(OUTPUT "${WL_GEN}/${nm}-protocol.c"
+         COMMAND "${WAYLAND_SCANNER}" private-code "${xml}" "${WL_GEN}/${nm}-protocol.c"
+         DEPENDS "${xml}")
+   endforeach()
+   target_sources(elements PRIVATE
+      "${WL_GEN}/fractional-scale-v1-client-protocol.h"
+      "${WL_GEN}/viewporter-client-protocol.h"
+      "${WL_GEN}/text-input-unstable-v3-client-protocol.h")
+   target_include_directories(elements PRIVATE "${WL_GEN}")
+endif()
+
+###############################################################################
 # Asio headers
-target_include_directories(elements PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/external/asio/asio/include)
+
+FetchContent_Declare(
+  asio
+  GIT_REPOSITORY https://github.com/chriskohlhoff/asio.git
+  GIT_TAG asio-1-36-0
+  GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(asio)
+
+target_include_directories(elements PUBLIC ${asio_SOURCE_DIR}/asio/include)
+
+###############################################################################
+# quill (logging) — no external deps; linked only by the elements target.
+
+FetchContent_Declare(
+  quill
+  GIT_REPOSITORY https://github.com/odygrd/quill.git
+  GIT_TAG v9.0.3
+  GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(quill)
+target_link_libraries(elements PUBLIC quill::quill)
 
 ###############################################################################
 # Global options
 
-if (APPLE)
+if (APPLE AND NOT ELEMENTS_HOST_UI_LIBRARY STREQUAL "headless")
    target_compile_definitions(elements PRIVATE
       ELEMENTS_CLASS_PREFIX=${ELEMENTS_CLASS_PREFIX}
    )
@@ -302,10 +490,31 @@ elseif (WIN32)
       BOOST_DATE_TIME_NO_LIB
       BOOST_REGEX_NO_LIB
    )
+
+   # Follow the configuration being built. CMAKE_BUILD_TYPE is empty for
+   # multi-config generators, and keying off the compiler picked the debug
+   # CRT for clang-cl even in Release, which mismatched elements and artist
+   # on _ITERATOR_DEBUG_LEVEL and failed the link.
+   set_property(TARGET elements PROPERTY
+      MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+   )
+
 endif()
 
-if(ELEMENTS_HOST_UI_LIBRARY STREQUAL "gtk")
+if(ELEMENTS_HOST_UI_LIBRARY STREQUAL "headless")
+    target_compile_definitions(elements PUBLIC ELEMENTS_HOST_UI_LIBRARY_HEADLESS)
+elseif(ELEMENTS_HOST_UI_LIBRARY STREQUAL "gtk")
     target_compile_definitions(elements PUBLIC ELEMENTS_HOST_UI_LIBRARY_GTK)
+elseif(ELEMENTS_HOST_UI_LIBRARY STREQUAL "x11")
+    if(NOT UNIX OR APPLE)
+        message(FATAL_ERROR "ELEMENTS_HOST_UI_LIBRARY=x11 is Linux/Unix only")
+    endif()
+    target_compile_definitions(elements PUBLIC ELEMENTS_HOST_UI_LIBRARY_X11)
+elseif(ELEMENTS_HOST_UI_LIBRARY STREQUAL "wayland")
+    if(NOT UNIX OR APPLE)
+        message(FATAL_ERROR "ELEMENTS_HOST_UI_LIBRARY=wayland is Linux/Unix only")
+    endif()
+    target_compile_definitions(elements PUBLIC ELEMENTS_HOST_UI_LIBRARY_WAYLAND)
 elseif(ELEMENTS_HOST_UI_LIBRARY STREQUAL "cocoa")
     if(NOT APPLE)
         message(FATAL_ERROR "Only macOS supports ELEMENTS_HOST_UI_LIBRARY=cocoa")
@@ -319,9 +528,13 @@ elseif(ELEMENTS_HOST_UI_LIBRARY STREQUAL "win32")
     if(ELEMENTS_HOST_ONLY_WIN7)
         target_compile_definitions(elements PRIVATE ELEMENTS_HOST_ONLY_WIN7)
         message(STATUS "Windows 7 compatibility enabled")
+    elseif(MINGW)
+        # Required by MinGW to enable SetProcessDpiAwareness (Windows 8.1+)
+        # and GetDpiForWindow (Windows 10+) API
+        target_compile_definitions(elements PRIVATE _WIN32_WINNT=0x0A00)
     endif()
 else()
-    message(FATAL_ERROR "Invalid ELEMENTS_HOST_UI_LIBRARY=${ELEMENTS_HOST_UI_LIBRARY}. Set gtk, cocoa or win32.")
+    message(FATAL_ERROR "Invalid ELEMENTS_HOST_UI_LIBRARY=${ELEMENTS_HOST_UI_LIBRARY}. Set gtk, x11, wayland, cocoa, win32 or headless.")
 endif()
 
 ###############################################################################
@@ -329,17 +542,32 @@ endif()
 
 if (UNIX OR (WIN32 AND NOT MSVC))
    find_package(Threads)
-   target_link_libraries(elements PUBLIC Threads::Threads)
+   target_link_libraries(elements PUBLIC Threads::Threads artist)
 endif()
 
 # ASIO requires this
 if (WIN32 AND NOT MSVC)
-   target_link_libraries(elements PUBLIC ws2_32)
+   target_link_libraries(elements PUBLIC ws2_32 artist)
 endif()
 
-# Replace missing Shcore library removed by WIN32_LEAN_AND_MEAN
+# Replace missing Shcore library removed by WIN32_LEAN_AND_MEAN, and the
+# input method library the Windows host places the IME windows with
 if (WIN32)
-   target_link_libraries(elements PUBLIC Shcore)
+   target_link_libraries(elements PUBLIC Shcore imm32 artist)
+endif()
+
+# The Win32 Skia host renders through WGL + Ganesh GL (lib/host/windows/
+# base_view.cpp), which needs opengl32/gdi32 — previously pulled in transitively
+# via the now-removed sk_app.
+if (WIN32 AND ELEMENTS_SKIA)
+   target_link_libraries(elements PUBLIC opengl32 gdi32)
+endif()
+
+# The macOS host needs QuartzCore: the Skia host renders through a
+# CAMetalLayer, and the Quartz 2D and Cairo hosts present benchmark frames as
+# layer contents (see lib/host/macos/base_view.mm).
+if (APPLE)
+   target_link_libraries(elements PUBLIC "-framework QuartzCore")
 endif()
 
 add_library(cycfi::elements ALIAS elements)

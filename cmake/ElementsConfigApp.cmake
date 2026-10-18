@@ -1,5 +1,5 @@
 ###############################################################################
-#  Copyright (c) 2016-2020 Joel de Guzman
+#  Copyright (c) 2016-2023 Joel de Guzman
 #
 #  Distributed under the MIT License (https://opensource.org/licenses/MIT)
 ###############################################################################
@@ -10,19 +10,24 @@ project(${ELEMENTS_APP_PROJECT} LANGUAGES CXX)
 # Sanitizers
 
 option(ASAN "Build with address sanitizer" OFF)
+option(LSAN "Build with leak sanitizer" OFF)
 option(TSAN "Build with thread sanitizer" OFF)
 option(UBSAN "Build with undefined Behavior sanitizer" OFF)
 
 macro(add_sanitizer flag)
    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=${flag} -fno-omit-frame-pointer")
-   set(DCMAKE_C_FLAGS "${DCMAKE_C_FLAGS} -fsanitize=${flag} -fno-omit-frame-pointer")
+   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=${flag} -fno-omit-frame-pointer")
    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=${flag}")
-   set(DCMAKE_MODULE_LINKER_FLAGS "${DCMAKE_MODULE_LINKER_FLAGS} -fsanitize=${flag}")
+   set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} -fsanitize=${flag}")
 endmacro()
 
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
    if (ASAN)
       add_sanitizer("address")
+   endif()
+
+   if (LSAN)
+      add_sanitizer("leak")
    endif()
 
    if (TSAN)
@@ -33,8 +38,19 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "GNU
       add_sanitizer("undefined")
    endif()
 else()
-   if (ASAN OR TSAN OR UBSAN)
+   if (ASAN OR LSAN OR TSAN OR UBSAN)
       message(FATAL_ERROR "Compiler is not supported.")
+   endif()
+endif()
+
+###############################################################################
+# Linux Open GL
+
+if (UNIX AND NOT APPLE)
+   find_package(PkgConfig REQUIRED)
+   # Only Skia renders through OpenGL.
+   if (ARTIST_SKIA)
+      find_package(OpenGL REQUIRED COMPONENTS OpenGL)
    endif()
 endif()
 
@@ -45,33 +61,29 @@ if (NOT DEFINED ELEMENTS_ICON_FONT)
    set(ELEMENTS_ICON_FONT ${ELEMENTS_ROOT}/resources/fonts/elements_basic.ttf)
 endif()
 
+# Every font in the bundle is registered with the system when the first
+# view is made, whether or not anything draws with it, and each face costs
+# a few milliseconds. So the default is what the default theme actually
+# names: Open Sans for labels and text boxes, Roboto Medium for headings,
+# and the icon font. An app that draws with another face lists it:
+#
+#    list(APPEND ELEMENTS_FONTS
+#       ${ELEMENTS_ROOT}/resources/fonts/OpenSans-Bold.ttf)
+#
+# before including this file. resources/fonts holds the rest: the Open Sans
+# and Roboto weights, and the Roboto Mono family the theme's monospaced
+# font names.
+if (NOT DEFINED ELEMENTS_FONTS)
+   set(ELEMENTS_FONTS
+      ${ELEMENTS_ROOT}/resources/fonts/OpenSans-Regular.ttf
+      ${ELEMENTS_ROOT}/resources/fonts/Roboto-Medium.ttf
+   )
+endif()
+
 set(ELEMENTS_RESOURCES
    ${ELEMENTS_ICON_FONT}
-   ${ELEMENTS_ROOT}/resources/fonts/OpenSans-Light.ttf
-   ${ELEMENTS_ROOT}/resources/fonts/OpenSans-Regular.ttf
-   ${ELEMENTS_ROOT}/resources/fonts/OpenSans-SemiBold.ttf
-   ${ELEMENTS_ROOT}/resources/fonts/OpenSans-Bold.ttf
-   ${ELEMENTS_ROOT}/resources/fonts/OpenSansCondensed-Light.ttf
-   ${ELEMENTS_ROOT}/resources/fonts/Roboto-Light.ttf
-   ${ELEMENTS_ROOT}/resources/fonts/Roboto-Regular.ttf
-   ${ELEMENTS_ROOT}/resources/fonts/Roboto-Medium.ttf
-   ${ELEMENTS_ROOT}/resources/fonts/Roboto-Bold.ttf
+   ${ELEMENTS_FONTS}
 )
-
-if (UNIX AND NOT APPLE)
-   file(
-      COPY ${ELEMENTS_RESOURCES} ${ELEMENTS_APP_RESOURCES}
-      DESTINATION "${CMAKE_CURRENT_BINARY_DIR}/resources"
-   )
-
-endif()
-
-if (WIN32)
-   file(
-      COPY ${ELEMENTS_RESOURCES} ${ELEMENTS_APP_RESOURCES}
-      DESTINATION "${CMAKE_CURRENT_BINARY_DIR}/resources"
-   )
-endif()
 
 source_group(Resources
    FILES
@@ -81,10 +93,6 @@ source_group(Resources
 
 ###############################################################################
 # The executable App
-
-if (NOT DEFINED ELEMENTS_APP_SOURCES)
-   set(ELEMENTS_APP_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp)
-endif()
 
 if (APPLE)
    add_executable(
@@ -111,29 +119,18 @@ elseif (WIN32)
    )
 
    if (MSVC)
+
+      # Follow the configuration being built. CMAKE_BUILD_TYPE is empty for
+      # multi-config generators, and keying off the compiler picked the debug
+      # CRT for clang-cl even in Release, which mismatched elements and artist
+      # on _ITERATOR_DEBUG_LEVEL and failed the link.
+      set_property(TARGET ${ELEMENTS_APP_PROJECT} PROPERTY
+         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+      )
+
       target_link_options(${ELEMENTS_APP_PROJECT} PRIVATE
          /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup shcore.lib
       )
-
-      if (CMAKE_SIZEOF_VOID_P EQUAL 8) # 64 bits?
-         set(CAIRO_DLL ${ELEMENTS_ROOT}/lib/external/cairo/lib/x64/cairo.dll)
-         set(FREETYPE_DLL ${ELEMENTS_ROOT}/lib/external/freetype/win64/freetype.dll)
-         set(FONTCONFIG_DLL ${ELEMENTS_ROOT}/lib/external/fontconfig/x64/fontconfig.dll)
-         set(ICONV_DLL ${ELEMENTS_ROOT}/lib/external/fontconfig/x64/libiconv.dll)
-         set(XML2 ${ELEMENTS_ROOT}/lib/external/fontconfig/x64/libxml2.dll)
-      else()
-         set(CAIRO_DLL ${ELEMENTS_ROOT}/lib/external/cairo/lib/x86/cairo.dll)
-         set(FREETYPE_DLL ${ELEMENTS_ROOT}/lib/external/freetype/win32/freetype.dll)
-         set(FONTCONFIG_DLL ${ELEMENTS_ROOT}/lib/external/fontconfig/x86/fontconfig.dll)
-         set(ICONV_DLL ${ELEMENTS_ROOT}/lib/external/fontconfig/x86/libiconv.dll)
-         set(XML2 ${ELEMENTS_ROOT}/lib/external/fontconfig/x86/libxml2.dll)
-      endif()
-
-      file(COPY ${CAIRO_DLL} DESTINATION "${CMAKE_CURRENT_BINARY_DIR}")
-      file(COPY ${FREETYPE_DLL} DESTINATION "${CMAKE_CURRENT_BINARY_DIR}")
-      file(COPY ${FONTCONFIG_DLL} DESTINATION "${CMAKE_CURRENT_BINARY_DIR}")
-      file(COPY ${ICONV_DLL} DESTINATION "${CMAKE_CURRENT_BINARY_DIR}")
-      file(COPY ${XML2} DESTINATION "${CMAKE_CURRENT_BINARY_DIR}")
 
       set_property(
          TARGET ${ELEMENTS_APP_PROJECT}
@@ -147,12 +144,17 @@ target_compile_options(${ELEMENTS_APP_PROJECT} PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/utf-8>
 )
 
+if (APPLE)
+   target_compile_options(${ELEMENTS_APP_PROJECT} PUBLIC "-fobjc-arc")
+endif()
+
 ###############################################################################
 # Libraries and linking
 
 target_link_libraries(${ELEMENTS_APP_PROJECT} PRIVATE
    ${ELEMENTS_APP_DEPENDENCIES}
    elements
+   ${OPENGL_LIBRARIES}
 )
 
 if (NOT DEFINED ELEMENTS_APP_INCLUDE_DIRECTORIES)
@@ -166,6 +168,61 @@ target_include_directories(${ELEMENTS_APP_PROJECT}
 if (APPLE)
    target_link_options(${ELEMENTS_APP_PROJECT} PRIVATE -framework AppKit)
 endif()
+
+###############################################################################
+# Copy the dependency DLLs (Windows)
+
+# Windows has no rpath: a DLL is found next to the executable or on PATH, so an
+# app linked against a shared dependency (libwebp via Artist's Direct2D
+# backend, Skia) dies at startup with 0xC0000135 unless its DLLs are beside it.
+# Copy whatever the linker actually pulled in, and skip the copy entirely when
+# there is nothing to copy, or the command would run with no files and fail.
+if (WIN32 AND NOT CMAKE_VERSION VERSION_LESS 3.21)
+   add_custom_command(
+      TARGET ${ELEMENTS_APP_PROJECT} POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E
+         $<IF:$<BOOL:$<TARGET_RUNTIME_DLLS:${ELEMENTS_APP_PROJECT}>>,copy_if_different,true>
+         $<TARGET_RUNTIME_DLLS:${ELEMENTS_APP_PROJECT}>
+         $<TARGET_FILE_DIR:${ELEMENTS_APP_PROJECT}>
+      COMMAND_EXPAND_LISTS
+   )
+endif()
+
+# Artist's prebuilt bundles ship DLLs that are not in TARGET_RUNTIME_DLLS
+# (see lib/artist/cmake/SkiaPrebuilt.cmake and CairoPrebuilt.cmake), so copy
+# them too.
+get_property(skia_dlls GLOBAL PROPERTY ARTIST_SKIA_RUNTIME_DLLS)
+get_property(cairo_dlls GLOBAL PROPERTY ARTIST_CAIRO_RUNTIME_DLLS)
+list(APPEND skia_dlls ${cairo_dlls})
+if (skia_dlls)
+   add_custom_command(
+      TARGET ${ELEMENTS_APP_PROJECT} POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+         ${skia_dlls} $<TARGET_FILE_DIR:${ELEMENTS_APP_PROJECT}>
+      COMMAND_EXPAND_LISTS
+   )
+endif()
+
+###############################################################################
+# Copy the resources
+
+# Use a generator expression to get the proper destination directory at build time
+set(DEST_DIR "$<TARGET_FILE_DIR:${ELEMENTS_APP_PROJECT}>/resources")
+
+# Ensure the destination directory exists
+add_custom_command(
+   TARGET ${ELEMENTS_APP_PROJECT} PRE_BUILD
+   COMMAND ${CMAKE_COMMAND} -E make_directory ${DEST_DIR}
+)
+
+# Loop through each resource file and create a custom command to copy each one
+foreach(FILE ${ELEMENTS_RESOURCES} ${ELEMENTS_APP_RESOURCES})
+   get_filename_component(FILE_NAME ${FILE} NAME)
+   add_custom_command(
+      TARGET ${ELEMENTS_APP_PROJECT} POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy ${FILE} ${DEST_DIR}/${FILE_NAME}
+   )
+endforeach()
 
 ###############################################################################
 # Resource file properties

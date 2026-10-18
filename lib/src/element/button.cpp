@@ -1,19 +1,25 @@
 /*=============================================================================
-   Copyright (c) 2016-2020 Joel de Guzman
+   Copyright (c) 2016-2023 Joel de Guzman
 
    Distributed under the MIT License [ https://opensource.org/licenses/MIT ]
 =============================================================================*/
 #include <elements/element/button.hpp>
 
-namespace cycfi { namespace elements
+namespace cycfi::elements
 {
-   ////////////////////////////////////////////////////////////////////////////
-   // Basic Button
-   ////////////////////////////////////////////////////////////////////////////
    bool basic_button::click(context const& ctx, mouse_button btn)
    {
+      if (!ctx.enabled || !is_enabled())
+         return false;
+
       if (btn.state != mouse_button::left || !ctx.bounds.includes(btn.pos))
       {
+         // Let go outside the button, or with another button: the press
+         // began tracking and this is where it ends. An unmatched begin
+         // leaves the view holding the element and anything watching for
+         // the end of the gesture waiting for it.
+         if (tracking())
+            on_tracking(ctx, end_tracking);
          tracking(false);
          ctx.view.refresh(ctx);
          return false;
@@ -27,29 +33,37 @@ namespace cycfi { namespace elements
       else
       {
          tracking(false);
-         on_tracking(ctx, end_tracking);
          if (on_click)
             on_click(true);
+         on_tracking(ctx, end_tracking);
          ctx.view.refresh(ctx);
       }
 
-      if (state(btn.down && ctx.bounds.includes(btn.pos)))
+      if (set_value(btn.down && ctx.bounds.includes(btn.pos)))
          ctx.view.refresh(ctx);
       return true;
    }
 
+   element* basic_button::hit_test(context const& ctx, point p, bool leaf, bool /*control*/)
+   {
+      return proxy_base::hit_test(ctx, p, leaf, false); // accept non-control subjects
+   }
+
    bool basic_button::cursor(context const& ctx, point /* p */, cursor_tracking status)
    {
-      hilite(status != cursor_tracking::leaving);
-      if (update_receiver())
-         ctx.view.refresh(ctx);
+      if (!is_enabled())
+         return false;
+      bool is_leaving = status != cursor_tracking::leaving;
+      if (_state.hilite != is_leaving)
+         hilite(is_leaving);
+      refresh(ctx);
       return false;
    }
 
    void basic_button::drag(context const& ctx, mouse_button btn)
    {
       this->hilite(ctx.bounds.includes(btn.pos));
-      if (state(ctx.bounds.includes(btn.pos)))
+      if (set_value(ctx.bounds.includes(btn.pos)))
          ctx.view.refresh(ctx);
    }
 
@@ -58,12 +72,21 @@ namespace cycfi { namespace elements
       return true;
    }
 
-   bool basic_button::state(bool val)
+   void basic_button::enable(bool state)
+   {
+      _state.enabled = state;
+   }
+
+   bool basic_button::is_enabled() const
+   {
+      return _state.enabled;
+   }
+
+   bool basic_button::set_value(bool val)
    {
       if (val != _state.value)
       {
          _state.value = val;
-         update_receiver();
          return true;
       }
       return false;
@@ -72,154 +95,201 @@ namespace cycfi { namespace elements
    void basic_button::tracking(bool val)
    {
       if (val != _state.tracking)
-      {
          _state.tracking = val;
-         update_receiver();
-      }
    }
    void basic_button::hilite(bool val)
    {
       if (val != _state.hilite)
-      {
          _state.hilite = val;
-         update_receiver();
-      }
    }
 
-   bool basic_button::update_receiver()
-   {
-      if (auto* rcvr = find_subject<receiver<int>*>(this))
-      {
-         rcvr->value((_state.value? 2 : 0) + _state.hilite);
-         return true;
-      }
-      else if (auto* rcvr = find_subject<receiver<button_state>*>(this))
-      {
-         rcvr->value(_state);
-         return true;
-      }
-      return false;
-   }
-
+   /**
+    * \brief
+    *    Set the value of the button
+    *
+    * \param val
+    *    A boolean value representing the value of the button `true` = ON,
+    *    `false` = OPF.
+    */
    void basic_button::value(bool val)
    {
       if (_state.value != val)
-         state(val);
+         set_value(val);
    }
 
-   void basic_button::send(bool val)
+   /**
+    *  \brief
+    *    Initiates editing the state of the button and sends notifications.
+    *
+    *    If `on_click` callback is set, it is called with the new state value
+    *    `val`, and the `notify_edit(view_)` function is called which sends
+    *    notifications about the state change.
+    *
+    *  \param view_
+    *    A reference to the view.
+    *
+    *  \param val
+    *    The new state value for the button: `true` if the button is ON, and
+    *    `false` if OFF.
+    */
+   void basic_button::edit(view& view_, bool val)
    {
       if (on_click)
          on_click(val);
+      receiver<bool>::notify_edit(view_);
    }
 
-   void basic_button::on_send(callback_function f)
+   bool basic_toggle_button::click(context const& ctx, mouse_button btn)
    {
-      on_click = f;
-   }
-
-   ////////////////////////////////////////////////////////////////////////////
-   // Layered Button
-   ////////////////////////////////////////////////////////////////////////////
-   element* layered_button::hit_test(context const& ctx, point p)
-   {
-      if (ctx.bounds.includes(p))
-         return this;
-      return 0;
-   }
-
-   bool layered_button::click(context const& ctx, mouse_button btn)
-   {
-      if (btn.state != mouse_button::left || !ctx.bounds.includes(btn.pos))
+      if (!ctx.enabled || !this->is_enabled())
          return false;
+
+      if (btn.state != mouse_button::left || !ctx.bounds.includes(btn.pos))
+      {
+         if (this->tracking())
+            this->on_tracking(ctx, this->end_tracking);
+         this->tracking(false);
+         ctx.view.refresh(ctx);
+         return false;
+      }
 
       if (btn.down)
       {
-         on_tracking(ctx, begin_tracking);
+         this->tracking(true);
+         this->on_tracking(ctx, this->begin_tracking);
+         if (this->set_value(!this->value()))   // toggle the state
+         {
+            ctx.view.refresh(ctx);              // we need to save the current state, the state
+            _current_state = this->value();     // can change in the drag function and so we'll
+         }                                      // need it later when the button is finally released
       }
       else
       {
-         on_tracking(ctx, end_tracking);
-         if (on_click)
-            on_click(true);
+         this->tracking(false);
+         this->set_value(_current_state);
+         if (this->on_click)
+            this->on_click(this->value());
+         this->on_tracking(ctx, this->end_tracking);
+         ctx.view.refresh(ctx);
+      }
+      return true;
+   }
+
+   void basic_toggle_button::drag(context const& ctx, mouse_button btn)
+   {
+      this->hilite(ctx.bounds.includes(btn.pos));
+      if (this->set_value(!_current_state ^ ctx.bounds.includes(btn.pos)))
+         ctx.view.refresh(ctx);
+   }
+
+   // A toggle's and a latching button's value is a state, so an edit sets
+   // it, as a slider's does. A momentary button's value is "pressed", which
+   // an edit leaves alone.
+   void basic_toggle_button::edit(view& view_, bool val)
+   {
+      set_value(val);
+      basic_button::edit(view_, val);
+   }
+
+   bool basic_latching_button::click(context const& ctx, mouse_button btn)
+   {
+      if (btn.down && this->value())
+         return false;
+
+      if (btn.state != mouse_button::left || !ctx.bounds.includes(btn.pos))
+      {
+         if (this->tracking())
+            this->on_tracking(ctx, this->end_tracking);
+         this->tracking(false);
+         ctx.view.refresh(ctx);
+         return false;
       }
 
-      if (state(btn.down && ctx.bounds.includes(btn.pos)))
-         ctx.view.refresh(ctx);
-      return true;
-   }
-
-   void layered_button::drag(context const& ctx, mouse_button btn)
-   {
-      if (state(ctx.bounds.includes(btn.pos)))
-         ctx.view.refresh(ctx);
-   }
-
-   bool layered_button::wants_control() const
-   {
-      return true;
-   }
-
-   bool layered_button::value() const
-   {
-      return _state;
-   }
-
-   bool layered_button::state(bool new_state)
-   {
-      if (new_state != _state)
+      if (btn.down)
       {
-         _state = new_state;
-         deck_element::select(_state);
-         return true;
+         this->tracking(true);
+         this->on_tracking(ctx, this->begin_tracking);
+      }
+      else
+      {
+         this->tracking(false);
+         if (this->on_click)
+            this->on_click(true);
+         this->on_tracking(ctx, this->end_tracking);
+         ctx.view.refresh(ctx);
+      }
+      if (btn.down && this->set_value(ctx.bounds.includes(btn.pos)))
+         ctx.view.refresh(ctx);
+      return true;
+   }
+
+   void basic_latching_button::edit(view& view_, bool val)
+   {
+      set_value(val);
+      basic_button::edit(view_, val);
+   }
+
+   bool basic_choice::click(context const& ctx, mouse_button btn)
+   {
+      if (btn.state == mouse_button::left)
+      {
+         if (btn.down)
+         {
+            return basic_latching_button::click(ctx, btn);
+         }
+         else
+         {
+            auto r = basic_latching_button::click(ctx, btn);
+            if (this->value())
+            {
+               auto [c, cctx] = find_composite(ctx);
+               if (c)
+               {
+                  for (std::size_t i = 0; i != c->size(); ++i)
+                  {
+                     if (auto e = find_element<selectable*>(&c->at(i)))
+                     {
+                        if (e == this)
+                        {
+                           // Set the button
+                           e->select(true);
+                        }
+                        else
+                        {
+                           if (e->is_selected())
+                           {
+                              // Reset the button
+                              e->select(false);
+                           }
+                        }
+                     }
+                  }
+               }
+               cctx->view.refresh(*cctx);
+            }
+            return r;
+         }
       }
       return false;
    }
 
-   void layered_button::value(bool new_state)
+   std::string basic_button::class_name() const
    {
-      if (_state != new_state)
-         state(new_state);
+      return "button";
    }
 
-   void layered_button::send(bool val)
+   std::string basic_toggle_button::class_name() const
    {
-      if (on_click)
-         on_click(val);
+      return "toggle_button";
    }
 
-   void layered_button::on_send(callback_function f)
+   std::string basic_latching_button::class_name() const
    {
-      on_click = f;
+      return "latching_button";
    }
 
-   void basic_choice_base::do_click(context const& ctx)
+   std::string basic_choice::class_name() const
    {
-      auto [c, cctx] = find_composite(ctx);
-      if (c)
-      {
-         for (std::size_t i = 0; i != c->size(); ++i)
-         {
-            if (auto e = find_element<basic_choice_base*>(&c->at(i)))
-            {
-               if (e == this)
-               {
-                  // Set the button
-                  e->select(true);
-                  // The base class::click should have called on_click already
-               }
-               else
-               {
-                  if (e->is_selected())
-                  {
-                     // Reset the button
-                     e->select(false);
-                     e->get_sender().send(false);
-                  }
-               }
-            }
-         }
-      }
-      cctx->view.refresh(*cctx);
+      return "choice";
    }
-}}
+}

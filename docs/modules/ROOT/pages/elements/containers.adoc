@@ -1,0 +1,30 @@
+= Containers
+
+include::../common.adoc[]
+
+== Overview
+
+A container holds content and decides how much of it is shown, and where.
+
+* xref:elements/ports.adoc[Ports and Scrollers]: a view of part of an
+  element larger than its space, moved by its alignment or by the user.
+* xref:elements/child_windows.adoc[Child Windows]: windows drawn inside
+  the view, which the user brings to the front, moves, resizes and
+  closes.
+* xref:elements/splits.adoc[Splits]: tiles whose boundaries the user
+  drags.
+* xref:elements/docking.adoc[Docking]: child windows the user docks
+  along the edges of the view, and floats again.
+* xref:elements/popups.adoc[Popups and Modals]: content that opens over
+  the view, and modals that block what is under them.
+* xref:elements/tooltips.adoc[Tooltips]: tips beside an element, when
+  the pointer rests on it.
+* xref:elements/menus.adoc[Menus]: menus that buttons open, and the
+  shortcuts of their items.
+* xref:elements/lists.adoc[Lists]: columns and rows of many items, made
+  as they come into view.
+
+'''
+
+_Copyright (c) 2014-2026 Joel de Guzman. All rights reserved._
+_Distributed under the {mit_license}_

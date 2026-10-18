@@ -1,23 +1,26 @@
 /*=============================================================================
-   Copyright (c) 2016-2020 Joel de Guzman
+   Copyright (c) 2016-2023 Joel de Guzman
 
    Distributed under the MIT License [ https://opensource.org/licenses/MIT ]
 =============================================================================*/
 #include <elements/element/menu.hpp>
 #include <infra/support.hpp>
+#include <utility>
 
-namespace cycfi { namespace elements
+namespace cycfi::elements
 {
-   element* basic_popup_element::hit_test(context const& /* ctx */, point p)
+   element* basic_popup_element::hit_test(context const &, point p, bool /*leaf*/, bool /*control*/)
    {
       return bounds().includes(p)? this : nullptr;
    }
 
    bool basic_popup_element::cursor(context const& ctx, point p, cursor_tracking status)
    {
-      bool hit = proxy_base::hit_test(ctx, p);
+      // The popup alone: what it draws changes as the cursor moves over a
+      // control in it, or leaves.
+      bool hit = proxy_base::hit_test(ctx, p, false, true);
       if (status == cursor_tracking::leaving || hit)
-         ctx.view.refresh();
+         ctx.view.refresh(ctx, bounds());
       bool r = proxy_base::cursor(ctx, p, status);
       on_cursor(p, status);
       return r;
@@ -30,36 +33,56 @@ namespace cycfi { namespace elements
 
    void basic_popup_element::open(view& view_)
    {
-      view_.add(shared_from_this());
+      view_.add(shared_from_this(), true);
+      view_.refresh();
    }
 
    void basic_popup_element::close(view& view_)
    {
       view_.remove(shared_from_this());
+      view_.refresh();
    }
 
-   element* basic_popup_menu_element::hit_test(context const& ctx, point p)
+   element* basic_popup_menu_element::hit_test(context const& ctx, point p, bool leaf, bool control)
    {
       // We call element::hit_test instead of proxy_base::hit_test because we
       // want to process hits/clicks outside the subject's bounds (e.g. to
       // dismiss the menu when clicked anywhere outside the menu bounds).
-      return element::hit_test(ctx, p);
+      return element::hit_test(ctx, p, leaf, control);
    }
 
    bool basic_popup_menu_element::click(context const& ctx, mouse_button btn)
    {
       auto new_ctx = ctx.sub_context();
-      bool hit = false;
-      new_ctx.listen<basic_menu_item_element>(
-         [&hit](auto const& /* ctx */, auto& /* e */, auto /* what */)
-         {
-            hit = true;
-         }
-      );
-
       auto r = floating_element::click(new_ctx, btn);
-      if (btn.down && (!r || hit))
-         on_click();
+      if (btn.down && !r)
+         close(ctx.view);
       return r;
    }
-}}
+
+   void basic_popup_menu_element::close(view& view_)
+   {
+      if (_submenu)
+      {
+         auto submenu = std::exchange(_submenu, nullptr);
+         submenu->close(view_);
+      }
+      basic_popup_element::close(view_);
+      if (_menu_button)
+         _menu_button->value(0);
+      if (_menu_item)
+         _menu_item->select(false);
+      if (_parent && _parent->_submenu == this)
+         _parent->_submenu = nullptr;
+   }
+
+   std::string basic_popup_element::class_name() const
+   {
+      return "popup";
+   }
+
+   std::string basic_popup_menu_element::class_name() const
+   {
+      return "popup_menu";
+   }
+}

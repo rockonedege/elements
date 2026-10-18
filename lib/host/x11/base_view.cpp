@@ -1,0 +1,1710 @@
+/*=============================================================================
+   Copyright (c) 2016-2023 Joel de Guzman
+
+   Distributed under the MIT License (https://opensource.org/licenses/MIT)
+=============================================================================*/
+#include <elements/base_view.hpp>
+#include <elements/window.hpp>
+#include <infra/assert.hpp>
+#include <artist/resources.hpp>
+#include <artist/canvas.hpp>
+#include <elements/support/perf.hpp>
+#include "x11_host.hpp"
+#include "../common/transfer.hpp"
+#include "../common/scroll_direction.hpp"
+
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/Xresource.h>
+#include <X11/Xatom.h>
+#include <X11/Xcursor/Xcursor.h>
+#include <X11/extensions/Xrandr.h>
+
+#if defined(ARTIST_SKIA)
+# include <EGL/egl.h>
+# include <GL/gl.h>
+# include <SkImage.h>
+# include <SkColorSpace.h>
+# include <SkCanvas.h>
+# include <SkSurface.h>
+# include <ganesh/GrDirectContext.h>
+# include <ganesh/GrBackendSurface.h>
+# include <ganesh/SkSurfaceGanesh.h>
+# include <ganesh/gl/GrGLInterface.h>
+# include <ganesh/gl/GrGLDirectContext.h>
+# include <ganesh/gl/GrGLBackendSurface.h>
+# include <ganesh/gl/GrGLTypes.h>
+# include <ganesh/gl/egl/GrGLMakeEGLInterface.h>
+# include <vector>
+#elif defined(ARTIST_CAIRO)
+# include <cairo.h>
+# include <cairo-xlib.h>
+#endif
+
+#include <limits.h>
+#include <unistd.h>
+#include <dlfcn.h>
+#include <locale.h>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+#include <string_view>
+#include <map>
+#include <array>
+#include <algorithm>
+#include <cstdlib>
+#include <cstdint>
+#include <cstdio>
+#include <chrono>
+
+namespace cycfi::artist
+{
+   namespace
+   {
+      fs::path exe_path()
+      {
+         char result[PATH_MAX];
+         ssize_t count = readlink("/proc/self/exe", result, PATH_MAX);
+         return std::string(result, (count > 0)? count : 0);
+      }
+
+      // The shared object this code lives in: the executable for an
+      // application, and for a plugin its own module, not the host that
+      // loaded it.
+      fs::path module_path()
+      {
+         Dl_info info;
+         if (dladdr(reinterpret_cast<void*>(&module_path), &info)
+            && info.dli_fname && *info.dli_fname)
+            return info.dli_fname;
+         return {};
+      }
+
+      fs::path find_resources()
+      {
+         // A plugin keeps its resources beside its module: in a VST3 bundle
+         // beside the architecture directory holding the library, and for a
+         // bare CLAP in a directory named after it. The same places the
+         // Windows host looks.
+         fs::path const module = module_path();
+         if (!module.empty() && module != exe_path())
+         {
+            fs::path const dir = module.parent_path();
+            fs::path const candidates[] =
+            {
+               dir / "resources",
+               dir.parent_path() / "Resources",
+               dir / (module.stem().string() + " Resources")
+            };
+            std::error_code ec;
+            for (auto const& path : candidates)
+               if (fs::is_directory(path, ec))
+                  return path;
+         }
+
+         fs::path const app_path = exe_path();
+         fs::path const app_dir = app_path.parent_path();
+
+         if (app_dir.filename() == "bin")
+         {
+            fs::path const path = app_dir.parent_path() / "share" / app_path.filename() / "resources";
+            if (fs::is_directory(path))
+               return path;
+         }
+         fs::path const app_resources_dir = app_dir / "resources";
+         if (fs::is_directory(app_resources_dir))
+            return app_resources_dir;
+         return fs::current_path() / "resources";
+      }
+   }
+
+   void init_paths()
+   {
+      add_search_path(find_resources());
+   }
+
+   fs::path get_user_fonts_directory()
+   {
+      return find_resources();
+   }
+}
+
+namespace cycfi::elements
+{
+   // Defined in key.cpp
+   key_code translate_key(unsigned keysym);
+
+   ////////////////////////////////////////////////////////////////////////////
+   // host_view
+   ////////////////////////////////////////////////////////////////////////////
+   struct host_view
+   {
+      using key_map = std::map<key_code, key_action>;
+
+      ::Window          window = 0;       // the X11 window we render into
+      double            scale  = 1.0;     // HiDPI scale
+      point             size;             // logical size
+      point             cursor_position;
+      bool              opened = false;
+      bool              owns_window = false;  // made here, so destroyed here
+      ::Time            click_time = 0;   // last button-press time (double-click)
+      int               click_count = 0;
+      ::Time            scroll_time = 0;  // last scroll event (acceleration)
+      ::Pixmap          pixmap = 0;       // offscreen back buffer (no flicker)
+      GC                gc = nullptr;
+      int               pix_w = 0, pix_h = 0;
+      rect              dirty;               // logical area to repaint next
+      bool              has_dirty = false;
+      bool              needs_full = true;   // the backing store is blank
+      XIC               xic = nullptr;    // input context (UTF-8 text entry)
+      key_map           keys;
+      int               modifiers = 0;
+#if defined(ARTIST_CAIRO)
+      cairo_surface_t*  surface = nullptr;  // Cairo surface on the pixmap
+#elif defined(ARTIST_SKIA)
+      EGLDisplay        egl_display = EGL_NO_DISPLAY;
+      EGLContext        egl_context = EGL_NO_CONTEXT;
+      EGLSurface        egl_surface = EGL_NO_SURFACE;
+      sk_sp<const GrGLInterface> xface;
+      sk_sp<GrDirectContext>     ctx;
+      sk_sp<SkSurface>           skia_surface;
+#endif
+      std::unique_ptr<drop_info> _drop_info;
+
+      // XDND (drag-and-drop) state for the in-flight drag, if any.
+      ::Window          xdnd_source = 0;   // the drag source window
+      int               xdnd_version = 0;
+      std::vector<std::string> xdnd_offered;  // native type names on offer
+      std::vector<std::string> xdnd_types;    // the same, as MIME types
+   };
+
+   struct platform_access
+   {
+      inline static host_view* get_host_view(base_view& view)
+      {
+         return view.host();
+      }
+   };
+
+   ////////////////////////////////////////////////////////////////////////////
+   // Platform layer — shared X11 state, lazily initialised on first use so it
+   // works with or without app/window (windowless plugin case).
+   ////////////////////////////////////////////////////////////////////////////
+   namespace
+   {
+      struct incr_transfer
+      {
+         ::Window    requestor;
+         Atom        property;
+         Atom        type;
+         std::string data;
+         std::size_t offset;
+         bool        done;
+         std::chrono::steady_clock::time_point last;   // of the last piece
+      };
+
+      struct platform
+      {
+         Display*  display = nullptr;
+         XIM       xim = nullptr;
+         Atom      wm_delete = 0;
+         Atom      a_clipboard = 0, a_utf8 = 0, a_targets = 0, a_clip_prop = 0;
+         Atom      a_xdnd_aware = 0, a_xdnd_enter = 0, a_xdnd_position = 0,
+                   a_xdnd_status = 0, a_xdnd_leave = 0, a_xdnd_drop = 0,
+                   a_xdnd_finished = 0, a_xdnd_selection = 0, a_xdnd_type_list = 0,
+                   a_xdnd_action_copy = 0, a_uri_list = 0, a_xdnd_prop = 0;
+         Atom      a_incr = 0;
+         ::Window  clip_window = 0;        // hidden selection window
+         payload   clip_data;              // the clipboard, while we own it
+
+         // Atom names, both ways, as they are asked for.
+         std::map<std::string, Atom> atoms;
+         std::map<Atom, std::string> names;
+
+         // Replies to other clients' requests being sent in pieces (INCR).
+         std::vector<incr_transfer> incr_transfers;
+
+         std::map<::Window, base_view*>            views;
+         std::map<::Window, std::function<void()>> closers;
+
+         std::map<cursor_type, Cursor> cursors;
+         ::Window  cursor_window = 0;       // window currently under the cursor
+         cursor_type cursor = cursor_type::arrow;
+
+         platform()
+         {
+            setlocale(LC_ALL, "");
+            XSetLocaleModifiers("");
+
+            display = XOpenDisplay(nullptr);
+            if (!display)
+               throw std::runtime_error("Failed to open X display");
+
+            wm_delete   = XInternAtom(display, "WM_DELETE_WINDOW", False);
+            a_clipboard = XInternAtom(display, "CLIPBOARD", False);
+            a_utf8      = XInternAtom(display, "UTF8_STRING", False);
+            a_targets   = XInternAtom(display, "TARGETS", False);
+            a_clip_prop = XInternAtom(display, "ELEMENTS_CLIPBOARD", False);
+            a_incr      = XInternAtom(display, "INCR", False);
+
+            a_xdnd_aware       = XInternAtom(display, "XdndAware", False);
+            a_xdnd_enter       = XInternAtom(display, "XdndEnter", False);
+            a_xdnd_position    = XInternAtom(display, "XdndPosition", False);
+            a_xdnd_status      = XInternAtom(display, "XdndStatus", False);
+            a_xdnd_leave       = XInternAtom(display, "XdndLeave", False);
+            a_xdnd_drop        = XInternAtom(display, "XdndDrop", False);
+            a_xdnd_finished    = XInternAtom(display, "XdndFinished", False);
+            a_xdnd_selection   = XInternAtom(display, "XdndSelection", False);
+            a_xdnd_type_list   = XInternAtom(display, "XdndTypeList", False);
+            a_xdnd_action_copy = XInternAtom(display, "XdndActionCopy", False);
+            a_uri_list         = XInternAtom(display, "text/uri-list", False);
+            a_xdnd_prop        = XInternAtom(display, "ELEMENTS_XDND", False);
+
+            xim = XOpenIM(display, nullptr, nullptr, nullptr);
+
+            clip_window = XCreateSimpleWindow(
+               display, RootWindow(display, DefaultScreen(display)),
+               -10, -10, 1, 1, 0, 0, 0);
+
+            // Selections are read into the clip window's properties, and
+            // large ones arrive in pieces, announced by property changes.
+            XSelectInput(display, clip_window, PropertyChangeMask);
+         }
+      };
+
+      platform& plat()
+      {
+         static platform the_platform;   // lazy: no app required
+         return the_platform;
+      }
+   }
+
+   Display* get_display()        { return plat().display; }
+   Atom     get_wm_delete_atom() { return plat().wm_delete; }
+   XIM      get_xim()            { return plat().xim; }
+
+   double display_scale()
+   {
+      double scale = 1.0;
+      if (char* rms = XResourceManagerString(plat().display))
+      {
+         if (XrmDatabase db = XrmGetStringDatabase(rms))
+         {
+            XrmValue value;
+            char* type = nullptr;
+            if (XrmGetResource(db, "Xft.dpi", "Xft.Dpi", &type, &value) && value.addr)
+               if (double dpi = std::atof(value.addr); dpi > 0)
+                  scale = dpi / 96.0;
+            XrmDestroyDatabase(db);
+         }
+      }
+      return scale;
+   }
+
+   // Per-monitor scale via XRandR: find the CRTC containing the point, derive
+   // its DPI from physical size, round to an integer scale. Falls back to the
+   // global Xft.dpi scale if no monitor matches. This gives correct sizing on
+   // mixed-DPI multi-monitor setups (works on pure X11 and under XWayland,
+   // which presents X11 windows 1:1 in the shared X coordinate space).
+   double monitor_scale(int px, int py)
+   {
+      Display* d = plat().display;
+      ::Window root = DefaultRootWindow(d);
+      double scale = 0.0;
+
+      if (XRRScreenResources* res = XRRGetScreenResourcesCurrent(d, root))
+      {
+         for (int i = 0; i < res->ncrtc && scale == 0.0; ++i)
+         {
+            XRRCrtcInfo* c = XRRGetCrtcInfo(d, res, res->crtcs[i]);
+            if (!c)
+               continue;
+            if (c->width > 0 && c->noutput > 0 &&
+                px >= c->x && px < c->x + int(c->width) &&
+                py >= c->y && py < c->y + int(c->height))
+            {
+               if (XRROutputInfo* o = XRRGetOutputInfo(d, res, c->outputs[0]))
+               {
+                  if (o->mm_width > 0)
+                  {
+                     double dpi = c->width / (o->mm_width / 25.4);
+                     scale = std::max(1.0, std::round(dpi / 96.0));
+                  }
+                  XRRFreeOutputInfo(o);
+               }
+            }
+            XRRFreeCrtcInfo(c);
+         }
+         XRRFreeScreenResources(res);
+      }
+      return scale > 0.0 ? scale : std::max(1.0, display_scale());
+   }
+
+   // Scale of the monitor under a window's center.
+   double window_scale(::Window w)
+   {
+      Display* d = plat().display;
+      ::Window root = DefaultRootWindow(d), child;
+      int rx = 0, ry = 0;
+      XTranslateCoordinates(d, w, root, 0, 0, &rx, &ry, &child);
+      XWindowAttributes attr;
+      XGetWindowAttributes(d, w, &attr);
+      return monitor_scale(rx + attr.width / 2, ry + attr.height / 2);
+   }
+
+   void register_close(::Window w, std::function<void()> on_close)
+   {
+      plat().closers[w] = std::move(on_close);
+   }
+   void unregister_close(::Window w) { plat().closers.erase(w); }
+
+   namespace
+   {
+      void register_view(::Window w, base_view* view) { plat().views[w] = view; }
+      void unregister_view(::Window w)                { plat().views.erase(w); }
+      base_view* find_view(::Window w)
+      {
+         auto i = plat().views.find(w);
+         return i == plat().views.end() ? nullptr : i->second;
+      }
+
+      bool fire_close(::Window w)
+      {
+         auto i = plat().closers.find(w);
+         if (i == plat().closers.end())
+            return false;
+         if (i->second)
+            i->second();
+         return true;
+      }
+   }
+
+   ////////////////////////////////////////////////////////////////////////////
+   // Cursor (themed, HiDPI via libXcursor)
+   ////////////////////////////////////////////////////////////////////////////
+   namespace
+   {
+      char const* cursor_name(cursor_type type)
+      {
+         switch (type)
+         {
+            case cursor_type::arrow:      return "left_ptr";
+            case cursor_type::ibeam:      return "xterm";
+            case cursor_type::cross_hair: return "crosshair";
+            case cursor_type::hand:       return "hand2";
+            case cursor_type::h_resize:   return "sb_h_double_arrow";
+            case cursor_type::v_resize:   return "sb_v_double_arrow";
+         }
+         return "left_ptr";
+      }
+
+      // Load (and cache) a themed cursor; XcursorLibraryLoadCursor respects
+      // Xcursor.theme / Xcursor.size, so it comes out at the right HiDPI size.
+      Cursor load_cursor(cursor_type type)
+      {
+         auto& cache = plat().cursors;
+         if (auto i = cache.find(type); i != cache.end())
+            return i->second;
+         Cursor c = XcursorLibraryLoadCursor(plat().display, cursor_name(type));
+         cache[type] = c;
+         return c;
+      }
+
+      void apply_cursor(::Window w, cursor_type type)
+      {
+         if (w)
+            if (Cursor c = load_cursor(type))
+               XDefineCursor(plat().display, w, c);
+      }
+   }
+
+   // No registration step; resources are found by path (see gtk3 host).
+   void init_resources() {}
+
+   void set_cursor(cursor_type type)
+   {
+      plat().cursor = type;
+      apply_cursor(plat().cursor_window, type);
+   }
+
+   ////////////////////////////////////////////////////////////////////////////
+   // Selections: the clipboard (CLIPBOARD) and a drop (XdndSelection) are
+   // both read the same way, by asking the owner to convert the selection
+   // to a target type. We own CLIPBOARD after set_clipboard, and answer
+   // other clients' requests for it.
+   ////////////////////////////////////////////////////////////////////////////
+   namespace
+   {
+      // Other clients' windows can go away, and their atoms can be bad,
+      // and Xlib's default error handler ends the process. Calls on them
+      // are made with the errors trapped: f's errors are ignored, and
+      // whether there were any is returned.
+      bool x_error_trapped = false;
+
+      int trap_x_error(Display*, XErrorEvent*)
+      {
+         x_error_trapped = true;
+         return 0;
+      }
+
+      template <typename F>
+      bool without_x_errors(F f)
+      {
+         auto* d = plat().display;
+         XSync(d, False);
+         x_error_trapped = false;
+         auto old = XSetErrorHandler(trap_x_error);
+         f();
+         XSync(d, False);
+         XSetErrorHandler(old);
+         return !x_error_trapped;
+      }
+
+      Atom atom(std::string const& name)
+      {
+         auto& p = plat();
+         if (auto i = p.atoms.find(name); i != p.atoms.end())
+            return i->second;
+         Atom a = XInternAtom(p.display, name.c_str(), False);
+         p.atoms[name] = a;
+         p.names[a] = name;
+         return a;
+      }
+
+      std::string atom_name(Atom a)
+      {
+         auto& p = plat();
+         if (a == None)
+            return {};
+         if (auto i = p.names.find(a); i != p.names.end())
+            return i->second;
+         std::string name;
+         without_x_errors(
+            [&]
+            {
+               if (char* n = XGetAtomName(p.display, a))
+               {
+                  name = n;
+                  XFree(n);
+               }
+            });
+         p.atoms[name] = a;
+         p.names[a] = name;
+         return name;
+      }
+
+      // Wait for an event of the type on the clip window that satisfies the
+      // predicate, up to the timeout. Other events of the type on the clip
+      // window are dropped: nothing else is waiting for them.
+      template <typename Pred>
+      bool wait_for(int type, XEvent& ev, Pred pred, int timeout_ms = 1000)
+      {
+         auto& p = plat();
+         XFlush(p.display);
+         for (int i = 0; i < timeout_ms; ++i)
+         {
+            while (XCheckTypedWindowEvent(p.display, p.clip_window, type, &ev))
+            {
+               if (pred(ev))
+                  return true;
+            }
+            usleep(1000);
+         }
+         return false;
+      }
+
+      // The bytes of a property, in the units of its format: chars for 8,
+      // shorts for 16 and longs (not 32-bit ints) for 32, as Xlib has them.
+      struct property
+      {
+         Atom        type = None;
+         int         format = 0;
+         std::string bytes;
+      };
+
+      property take_property(::Window w, Atom prop)
+      {
+         auto& p = plat();
+         property result;
+         unsigned long n = 0, after = 0;
+         unsigned char* data = nullptr;
+         if (XGetWindowProperty(p.display, w, prop, 0, LONG_MAX / 4, True,
+               AnyPropertyType, &result.type, &result.format, &n, &after, &data) == Success
+            && data)
+         {
+            std::size_t unit = result.format == 32 ? sizeof(long)
+                             : result.format == 16 ? sizeof(short) : 1;
+            result.bytes.assign(reinterpret_cast<char*>(data), n * unit);
+            XFree(data);
+         }
+         return result;
+      }
+
+      // Convert a selection to a target and read the result, following the
+      // INCR protocol when the owner sends it in pieces.
+      std::optional<property> read_selection(Atom selection, Atom target, ::Time t)
+      {
+         auto& p = plat();
+         XDeleteProperty(p.display, p.clip_window, p.a_clip_prop);
+         XConvertSelection(p.display, selection, target, p.a_clip_prop, p.clip_window, t);
+
+         XEvent ev;
+         bool got = wait_for(SelectionNotify, ev,
+            [&](XEvent& e)
+            {
+               return e.xselection.selection == selection
+                  && e.xselection.target == target;
+            });
+         if (!got || ev.xselection.property == None)
+            return std::nullopt;
+
+         auto result = take_property(p.clip_window, p.a_clip_prop);
+         if (result.type != p.a_incr)
+            return result;
+
+         // INCR: deleting the property (done by take_property) asks for the
+         // next piece; an empty piece ends the transfer.
+         result.bytes.clear();
+         for (;;)
+         {
+            bool more = wait_for(PropertyNotify, ev,
+               [&](XEvent& e)
+               {
+                  return e.xproperty.atom == p.a_clip_prop
+                     && e.xproperty.state == PropertyNewValue;
+               });
+            if (!more)
+               return std::nullopt;
+            auto piece = take_property(p.clip_window, p.a_clip_prop);
+            if (piece.type == None)
+               continue;      // the INCR announcement's own notification
+            if (piece.bytes.empty())
+               break;
+            result.type = piece.type;
+            result.format = piece.format;
+            result.bytes += piece.bytes;
+         }
+         return result;
+      }
+
+      std::vector<std::string> atom_names(Atom const* atoms, std::size_t n)
+      {
+         std::vector<std::string> names;
+         for (std::size_t i = 0; i != n; ++i)
+         {
+            if (atoms[i] != None)
+               names.push_back(atom_name(atoms[i]));
+         }
+         return names;
+      }
+
+      // The native names of the types the owner of the selection offers.
+      std::vector<std::string> selection_targets(Atom selection, ::Time t)
+      {
+         auto targets = read_selection(selection, plat().a_targets, t);
+         if (!targets || targets->format != 32)
+            return {};
+         return atom_names(
+            reinterpret_cast<Atom const*>(targets->bytes.data()),
+            targets->bytes.size() / sizeof(Atom));
+      }
+
+      // Read each of the MIME types asked for that are on offer.
+      payload read_payload(
+         Atom selection, ::Time t
+       , std::vector<std::string> const& offered, mime_types const& types)
+      {
+         payload result;
+         for (auto const& mime : types)
+         {
+            if (auto name = transfer::best_name(mime, offered))
+            {
+               if (auto data = read_selection(selection, atom(*name), t))
+                  result[mime] = transfer::from_wire(*name, mime, data->bytes);
+            }
+         }
+         return result;
+      }
+
+      bool own_clipboard()
+      {
+         auto& p = plat();
+         return XGetSelectionOwner(p.display, p.a_clipboard) == p.clip_window;
+      }
+
+      // Larger replies than this go in pieces (INCR), as the server may
+      // not take them in one request.
+      std::size_t max_reply_size()
+      {
+         auto& p = plat();
+         long max = XExtendedMaxRequestSize(p.display);
+         if (max == 0)
+            max = XMaxRequestSize(p.display);
+         return std::min<std::size_t>(std::size_t(max) * 4 - 1024, 256 * 1024);
+      }
+
+      // Send the next piece of an INCR reply, after the requestor deleted
+      // the last one. An empty piece ends it.
+      void send_incr_piece(incr_transfer& x)
+      {
+         auto& p = plat();
+         auto size = std::min(max_reply_size(), x.data.size() - x.offset);
+         XChangeProperty(p.display, x.requestor, x.property, x.type, 8,
+            PropModeReplace,
+            reinterpret_cast<unsigned char const*>(x.data.data() + x.offset), int(size));
+         x.offset += size;
+         x.last = std::chrono::steady_clock::now();
+         if (size == 0)
+            x.done = true;
+         XFlush(p.display);
+      }
+
+      // Forget the transfers that are done, and those whose requestor
+      // stopped taking pieces.
+      void forget_incr_transfers()
+      {
+         auto& p = plat();
+         auto expired = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+         p.incr_transfers.erase(
+            std::remove_if(p.incr_transfers.begin(), p.incr_transfers.end(),
+               [&](auto const& x) { return x.done || x.last < expired; }),
+            p.incr_transfers.end());
+      }
+
+      void handle_incr_progress(XPropertyEvent& e)
+      {
+         auto& p = plat();
+         if (e.state != PropertyDelete)
+            return;
+         for (auto& x : p.incr_transfers)
+         {
+            if (x.requestor == e.window && x.property == e.atom && !x.done)
+            {
+               without_x_errors([&] { send_incr_piece(x); });
+               break;
+            }
+         }
+         forget_incr_transfers();
+      }
+
+      void answer_selection_request(XSelectionRequestEvent& req)
+      {
+         auto& p = plat();
+         XSelectionEvent resp = {};
+         resp.type      = SelectionNotify;
+         resp.display   = req.display;
+         resp.requestor = req.requestor;
+         resp.selection = req.selection;
+         resp.target    = req.target;
+         resp.time      = req.time;
+         resp.property  = req.property != None ? req.property : req.target;
+
+         forget_incr_transfers();
+         std::string target = atom_name(req.target);
+         std::optional<std::string> mime =
+            req.selection == p.a_clipboard ? transfer::mime_type(target) : std::nullopt;
+         auto entry = mime ? p.clip_data.find(*mime) : p.clip_data.end();
+
+         if (req.selection == p.a_clipboard && req.target == p.a_targets)
+         {
+            std::vector<Atom> targets = {p.a_targets};
+            for (auto const& [type, data] : p.clip_data)
+            {
+               for (auto const& name : transfer::native_names(type))
+                  targets.push_back(atom(name));
+            }
+            XChangeProperty(p.display, req.requestor, resp.property, XA_ATOM, 32,
+               PropModeReplace, reinterpret_cast<unsigned char*>(targets.data()),
+               int(targets.size()));
+         }
+         else if (entry != p.clip_data.end())
+         {
+            std::string bytes = transfer::to_wire(target, *mime, entry->second);
+            if (bytes.size() > max_reply_size())
+            {
+               // Too large for one reply: announce the size and send it in
+               // pieces as the requestor deletes each one.
+               XSelectInput(p.display, req.requestor, PropertyChangeMask);
+               long size = long(bytes.size());
+               XChangeProperty(p.display, req.requestor, resp.property, p.a_incr, 32,
+                  PropModeReplace, reinterpret_cast<unsigned char*>(&size), 1);
+               p.incr_transfers.push_back(
+                  {req.requestor, resp.property, req.target, std::move(bytes), 0, false,
+                   std::chrono::steady_clock::now()});
+            }
+            else
+            {
+               XChangeProperty(p.display, req.requestor, resp.property, req.target, 8,
+                  PropModeReplace, reinterpret_cast<unsigned char const*>(bytes.data()),
+                  int(bytes.size()));
+            }
+         }
+         else
+         {
+            resp.property = None;   // MULTIPLE, or a type we do not hold
+         }
+
+         XSendEvent(p.display, req.requestor, False, 0, (XEvent*)&resp);
+         XFlush(p.display);
+      }
+
+      // The requestor may be gone by the time we answer.
+      void handle_selection_request(XSelectionRequestEvent& req)
+      {
+         without_x_errors([&] { answer_selection_request(req); });
+      }
+   }
+
+   std::vector<std::string> clipboard_types()
+   {
+      auto& p = plat();
+      if (own_clipboard())
+      {
+         std::vector<std::string> types;
+         for (auto const& [type, data] : p.clip_data)
+            types.push_back(type);
+         return types;
+      }
+      return transfer::mime_types_of(selection_targets(p.a_clipboard, CurrentTime));
+   }
+
+   payload get_clipboard(mime_types const& types)
+   {
+      auto& p = plat();
+      if (own_clipboard())
+      {
+         payload result;
+         for (auto const& type : types)
+         {
+            if (auto i = p.clip_data.find(type); i != p.clip_data.end())
+               result[type] = transfer::as_received(type, i->second);
+         }
+         return result;
+      }
+      auto offered = selection_targets(p.a_clipboard, CurrentTime);
+      return read_payload(p.a_clipboard, CurrentTime, offered, types);
+   }
+
+   void set_clipboard(payload const& data)
+   {
+      auto& p = plat();
+      p.clip_data = data;
+      XSetSelectionOwner(p.display, p.a_clipboard, p.clip_window, CurrentTime);
+      XFlush(p.display);
+   }
+
+   point scroll_direction()
+   {
+      return linux_host::scroll_direction();
+   }
+
+   ////////////////////////////////////////////////////////////////////////////
+   // Rendering
+   ////////////////////////////////////////////////////////////////////////////
+   namespace
+   {
+      void window_pixel_size(::Window w, int& width, int& height)
+      {
+         XWindowAttributes attr;
+         XGetWindowAttributes(plat().display, w, &attr);
+         width = attr.width;
+         height = attr.height;
+      }
+
+#if defined(ARTIST_SKIA)
+      // The window was already created (by window.cpp) with the default visual.
+      // For EGL we must pick a config whose native visual matches the window's,
+      // else eglCreateWindowSurface fails with BadMatch.
+      EGLConfig choose_egl_config(EGLDisplay dpy, VisualID vid)
+      {
+         EGLint attribs[] = {
+            EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+            EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
+            EGL_NONE
+         };
+         EGLint n = 0;
+         eglChooseConfig(dpy, attribs, nullptr, 0, &n);
+         if (n <= 0)
+            return nullptr;
+         std::vector<EGLConfig> cfgs(n);
+         eglChooseConfig(dpy, attribs, cfgs.data(), n, &n);
+         for (auto c : cfgs)
+         {
+            EGLint cvid = 0;
+            eglGetConfigAttrib(dpy, c, EGL_NATIVE_VISUAL_ID, &cvid);
+            if (VisualID(cvid) == vid)
+               return c;
+         }
+         return cfgs[0];   // fallback
+      }
+
+      // Initialise EGL on the existing window + the Skia GL context.
+      void init_egl_skia(host_view* h)
+      {
+         Display* d = plat().display;
+         h->egl_display = eglGetDisplay((EGLNativeDisplayType)d);
+         if (h->egl_display == EGL_NO_DISPLAY || !eglInitialize(h->egl_display, nullptr, nullptr))
+            throw std::runtime_error("EGL init failed");
+         eglBindAPI(EGL_OPENGL_API);
+
+         XWindowAttributes attr;
+         XGetWindowAttributes(d, h->window, &attr);
+         EGLConfig cfg = choose_egl_config(h->egl_display, XVisualIDFromVisual(attr.visual));
+         if (!cfg)
+            throw std::runtime_error("No matching EGL config for window visual");
+
+         EGLint ctx_attribs[] = { EGL_NONE };
+         h->egl_context = eglCreateContext(h->egl_display, cfg, EGL_NO_CONTEXT, ctx_attribs);
+         h->egl_surface = eglCreateWindowSurface(
+            h->egl_display, cfg, (EGLNativeWindowType)h->window, nullptr);
+         if (h->egl_context == EGL_NO_CONTEXT || h->egl_surface == EGL_NO_SURFACE)
+            throw std::runtime_error("EGL context/surface creation failed");
+         if (!eglMakeCurrent(h->egl_display, h->egl_surface, h->egl_surface, h->egl_context))
+            throw std::runtime_error("eglMakeCurrent failed");
+
+         // For benchmarking, don't block the swap on vsync so the frame period
+         // reflects true render throughput rather than the display refresh.
+         if (perf::enabled())
+            eglSwapInterval(h->egl_display, 0);
+
+         h->xface = GrGLMakeNativeInterface();
+         if (!h->xface)
+            h->xface = GrGLInterfaces::MakeEGL();
+         if (!h->xface)
+            throw std::runtime_error("GrGLMakeNativeInterface / MakeEGL failed");
+         h->ctx = GrDirectContexts::MakeGL(h->xface);
+         if (!h->ctx)
+            throw std::runtime_error("GrDirectContexts::MakeGL failed");
+      }
+#endif
+
+      void create_backing(host_view* h, int w, int hgt)
+      {
+         Display* d = plat().display;
+         h->pix_w = w;
+         h->pix_h = hgt;
+         h->needs_full = true;
+
+#if defined(ARTIST_CAIRO)
+         int screen = DefaultScreen(d);
+         if (h->surface) { cairo_surface_destroy(h->surface); h->surface = nullptr; }
+         if (h->pixmap)  { XFreePixmap(d, h->pixmap); h->pixmap = 0; }
+         h->pixmap = XCreatePixmap(d, h->window, w, hgt, DefaultDepth(d, screen));
+         h->surface = cairo_xlib_surface_create(
+            d, h->pixmap, DefaultVisual(d, screen), w, hgt);
+         cairo_surface_set_device_scale(h->surface, h->scale, h->scale);
+#elif defined(ARTIST_SKIA)
+         // EGL renders directly into the window (double-buffered via swap), so
+         // no pixmap. Recreate the Skia render target wrapping the framebuffer.
+         (void)d;
+         h->skia_surface.reset();
+         eglMakeCurrent(h->egl_display, h->egl_surface, h->egl_surface, h->egl_context);
+         GrGLFramebufferInfo info;
+         info.fFBOID  = 0;
+         info.fFormat = GL_RGBA8;
+         auto target = GrBackendRenderTargets::MakeGL(w, hgt, 0, 8, info);
+         h->skia_surface = SkSurfaces::WrapBackendRenderTarget(
+            h->ctx.get(), target, kBottomLeft_GrSurfaceOrigin,
+            kRGBA_8888_SkColorType, nullptr, nullptr);
+#endif
+      }
+
+      // Add to the area the next render repaints, in logical coordinates.
+      void invalidate(host_view* h, rect area)
+      {
+         h->dirty = h->has_dirty? artist::union_(h->dirty, area) : area;
+         h->has_dirty = true;
+      }
+
+      // Take the area to repaint: what was invalidated since the last render,
+      // or the whole view when the backing store is new or nothing was.
+      rect take_dirty(host_view* h)
+      {
+         rect const all{0, 0, h->size.x, h->size.y};
+         rect const area = (h->needs_full || !h->has_dirty)?
+            all : artist::intersection(h->dirty, all);
+         h->needs_full = false;
+         h->has_dirty = false;
+         return area;
+      }
+
+      struct pixel_rect
+      {
+         int x, y, w, h;
+      };
+
+      // The device pixels covering a logical area, rounded outward and kept
+      // inside a max_w by max_h store.
+      pixel_rect pixel_bounds(double scale, rect area, int max_w, int max_h)
+      {
+         int const x1 = std::max(0, int(std::floor(area.left * scale)));
+         int const y1 = std::max(0, int(std::floor(area.top * scale)));
+         int const x2 = std::min(max_w, int(std::ceil(area.right * scale)));
+         int const y2 = std::min(max_h, int(std::ceil(area.bottom * scale)));
+         return {x1, y1, std::max(0, x2 - x1), std::max(0, y2 - y1)};
+      }
+
+      void do_render(base_view& view)
+      {
+         auto* h = platform_access::get_host_view(view);
+         Display* d = plat().display;
+#if defined(ARTIST_CAIRO)
+         if (!h->surface)
+            return;
+
+         // The pixmap keeps the last frame, so only the invalidated area is
+         // drawn, through a clip, and only its pixels go to the window.
+         auto const area = take_dirty(h);
+         if (area.width() <= 0 || area.height() <= 0)
+            return;
+
+         auto const t0 = std::chrono::steady_clock::now();
+         auto* cr = cairo_create(h->surface);
+         auto cnv = canvas{cr};
+         cnv.add_rect(area);
+         cnv.clip();
+         view.draw(cnv);
+         cairo_destroy(cr);
+         cairo_surface_flush(h->surface);
+         double const draw_flush_ms =
+            std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - t0).count();
+         if (h->pixmap && h->gc)
+         {
+            auto const px = pixel_bounds(h->scale, area, h->pix_w, h->pix_h);
+            XCopyArea(d, h->pixmap, h->window, h->gc,
+               px.x, px.y, px.w, px.h, px.x, px.y);
+         }
+         XFlush(d);
+         perf::record(draw_flush_ms);
+#elif defined(ARTIST_SKIA)
+         (void)d;
+         if (!h->skia_surface)
+            return;
+
+         // EGL does not keep the back buffer across a swap, so every frame is
+         // drawn whole.
+         take_dirty(h);
+         auto const t0 = std::chrono::steady_clock::now();
+         SkCanvas* gpu = h->skia_surface->getCanvas();
+         gpu->save();
+         gpu->scale(h->scale, h->scale);   // logical → physical
+         auto cnv = canvas{gpu};
+         view.draw(cnv);
+         gpu->restore();
+         h->ctx->flushAndSubmit(h->skia_surface.get(),
+            perf::enabled()? GrSyncCpu::kYes : GrSyncCpu::kNo);
+         double const draw_flush_ms =
+            std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - t0).count();
+         eglSwapBuffers(h->egl_display, h->egl_surface);
+         perf::record(draw_flush_ms);
+#endif
+      }
+   }
+
+   ////////////////////////////////////////////////////////////////////////////
+   // Input helpers
+   ////////////////////////////////////////////////////////////////////////////
+   namespace
+   {
+      constexpr ::Time double_click_ms = 250;
+
+      int get_mods(unsigned state)
+      {
+         int mods = 0;
+         if (state & ShiftMask)   mods |= mod_shift;
+         if (state & ControlMask) mods |= mod_control | mod_action;
+         if (state & Mod1Mask)    mods |= mod_alt;
+         if (state & Mod4Mask)    mods |= mod_super;
+         return mods;
+      }
+
+      point logical_pos(host_view* h, int x, int y)
+      {
+         return {float(x / h->scale), float(y / h->scale)};
+      }
+
+      bool get_button(XButtonEvent& e, mouse_button& btn, host_view* h)
+      {
+         if (e.button < 1 || e.button > 3)
+            return false;
+
+         btn.modifiers = get_mods(e.state);
+         if (e.type == ButtonPress)
+         {
+            btn.down = true;
+            if ((e.time - h->click_time) < double_click_ms)
+               ++h->click_count;
+            else
+               h->click_count = 1;
+            h->click_time = e.time;
+         }
+         else
+         {
+            btn.down = false;
+         }
+
+         switch (e.button)
+         {
+            case 1: btn.state = mouse_button::left;   break;
+            case 2: btn.state = mouse_button::middle; break;
+            case 3: btn.state = mouse_button::right;  break;
+            default: return false;
+         }
+
+         btn.num_clicks = h->click_count;
+         btn.pos = logical_pos(h, e.x, e.y);
+         return true;
+      }
+
+      void handle_key(base_view& view, host_view::key_map& keys, key_info k)
+      {
+         bool repeated = false;
+         if (k.action == key_action::release)
+         {
+            keys.erase(k.key);
+            view.key(k);
+            return;
+         }
+         if (k.action == key_action::press && keys[k.key] == key_action::press)
+            repeated = true;
+         keys[k.key] = k.action;
+         if (repeated)
+            k.action = key_action::repeat;
+         view.key(k);
+      }
+
+      int next_codepoint(char const* s, int len, std::uint32_t& cp)
+      {
+         if (len <= 0)
+            return 0;
+         unsigned char c = (unsigned char)s[0];
+         if (c < 0x80)            { cp = c; return 1; }
+         else if ((c >> 5) == 0x6 && len >= 2)
+            { cp = ((c & 0x1F) << 6) | (s[1] & 0x3F); return 2; }
+         else if ((c >> 4) == 0xE && len >= 3)
+            { cp = ((c & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F); return 3; }
+         else if ((c >> 3) == 0x1E && len >= 4)
+            { cp = ((c & 0x07) << 18) | ((s[1] & 0x3F) << 12) |
+                   ((s[2] & 0x3F) << 6) | (s[3] & 0x3F); return 4; }
+         return 0;
+      }
+   }
+
+   ////////////////////////////////////////////////////////////////////////////
+   // Drag-and-drop (XDND target side): a drop is a selection, XdndSelection,
+   // read like the clipboard. While the drag hovers, the payload holds the
+   // MIME types on offer, with no data; the data is read on the drop.
+   ////////////////////////////////////////////////////////////////////////////
+   namespace
+   {
+      constexpr long the_xdnd_version = 5;
+
+      void send_xdnd(::Window target, Atom message,
+         long d0, long d1, long d2, long d3, long d4)
+      {
+         auto& p = plat();
+         XClientMessageEvent m = {};
+         m.type         = ClientMessage;
+         m.display      = p.display;
+         m.window       = target;
+         m.message_type = message;
+         m.format       = 32;
+         m.data.l[0] = d0; m.data.l[1] = d1; m.data.l[2] = d2;
+         m.data.l[3] = d3; m.data.l[4] = d4;
+         without_x_errors(   // the source may be gone
+            [&] { XSendEvent(p.display, target, False, NoEventMask, (XEvent*)&m); });
+      }
+
+      // The offered types are inline in XdndEnter (≤3) or, if the low bit of
+      // data.l[1] is set, in the source's XdndTypeList property.
+      std::vector<std::string> source_offers(XClientMessageEvent& e)
+      {
+         auto& p = plat();
+         if (e.data.l[1] & 1)
+         {
+            Atom type; int fmt; unsigned long n = 0, after; unsigned char* data = nullptr;
+            without_x_errors(   // the source may be gone
+               [&]
+               {
+                  if (XGetWindowProperty(p.display, e.data.l[0], p.a_xdnd_type_list, 0, 1024,
+                     False, XA_ATOM, &type, &fmt, &n, &after, &data) != Success)
+                     data = nullptr;
+               });
+            std::vector<std::string> names;
+            if (data)
+            {
+               names = atom_names(reinterpret_cast<Atom*>(data), n);
+               XFree(data);
+            }
+            return names;
+         }
+         Atom inline_types[] = {Atom(e.data.l[2]), Atom(e.data.l[3]), Atom(e.data.l[4])};
+         return atom_names(inline_types, 3);
+      }
+
+      point xdnd_logical_pos(host_view* h, long packed_xy)
+      {
+         Display* d = plat().display;
+         int rx = int((packed_xy >> 16) & 0xffff);
+         int ry = int(packed_xy & 0xffff);
+         ::Window child;
+         int wx = 0, wy = 0;
+         XTranslateCoordinates(d, DefaultRootWindow(d), h->window, rx, ry, &wx, &wy, &child);
+         return logical_pos(h, wx, wy);
+      }
+
+      void handle_xdnd(base_view& view, host_view* h, XClientMessageEvent& e)
+      {
+         auto& p = plat();
+
+         if (e.message_type == p.a_xdnd_enter)
+         {
+            h->xdnd_source  = e.data.l[0];
+            h->xdnd_version = (e.data.l[1] >> 24) & 0xff;
+            h->xdnd_offered = source_offers(e);
+            h->xdnd_types   = transfer::accepted_types(
+               transfer::mime_types_of(h->xdnd_offered), view.accepted_drop_types());
+         }
+         else if (e.message_type == p.a_xdnd_position)
+         {
+            h->xdnd_source = e.data.l[0];
+            point pos = xdnd_logical_pos(h, e.data.l[2]);
+            h->cursor_position = pos;
+            bool accept = !h->xdnd_types.empty();
+
+            if (accept)
+            {
+               if (!h->_drop_info)
+               {
+                  h->_drop_info = std::make_unique<drop_info>();
+                  for (auto const& type : h->xdnd_types)
+                     h->_drop_info->data[type] = std::string{};   // no data yet
+                  h->_drop_info->where = pos;
+                  view.track_drop(*h->_drop_info, cursor_tracking::entering);
+               }
+               else
+               {
+                  h->_drop_info->where = pos;
+                  view.track_drop(*h->_drop_info, cursor_tracking::hovering);
+               }
+            }
+
+            // Accept (action copy) if the view takes any of the types on
+            // offer; rect = 0 so the source keeps sending position updates
+            // for every move.
+            send_xdnd(h->xdnd_source, p.a_xdnd_status, long(h->window),
+               accept ? 1 : 0, 0, 0,
+               accept ? long(p.a_xdnd_action_copy) : long(None));
+         }
+         else if (e.message_type == p.a_xdnd_leave)
+         {
+            if (h->_drop_info)
+            {
+               view.track_drop(*h->_drop_info, cursor_tracking::leaving);
+               h->_drop_info.reset();
+            }
+            h->xdnd_source = 0;
+            h->xdnd_offered.clear();
+            h->xdnd_types.clear();
+         }
+         else if (e.message_type == p.a_xdnd_drop)
+         {
+            ::Window source = e.data.l[0];
+            ::Time   t = e.data.l[2] ? ::Time(e.data.l[2]) : CurrentTime;
+            bool success = false;
+
+            if (h->_drop_info)
+            {
+               mime_types types(h->xdnd_types.begin(), h->xdnd_types.end());
+               auto data = read_payload(p.a_xdnd_selection, t, h->xdnd_offered, types);
+               if (!data.empty())
+               {
+                  h->_drop_info->data = std::move(data);
+                  success = view.drop(*h->_drop_info);
+               }
+            }
+
+            // Tell the source the transfer is complete.
+            send_xdnd(source, p.a_xdnd_finished, long(h->window),
+               success ? 1 : 0,
+               success ? long(p.a_xdnd_action_copy) : long(None), 0, 0);
+
+            h->_drop_info.reset();
+            h->xdnd_source = 0;
+            h->xdnd_offered.clear();
+            h->xdnd_types.clear();
+         }
+      }
+   }
+
+   ////////////////////////////////////////////////////////////////////////////
+   // Per-view event handling
+   ////////////////////////////////////////////////////////////////////////////
+   namespace
+   {
+      void handle_view_event(base_view& view, XEvent& ev)
+      {
+         auto* h = platform_access::get_host_view(view);
+
+         switch (ev.type)
+         {
+            case Expose:
+            {
+#if defined(ARTIST_CAIRO)
+               // Once the pixmap holds a frame, an exposed part only has to go
+               // back on the window: nothing is redrawn.
+               if (h->opened && h->pixmap && h->gc)
+               {
+                  auto const& e = ev.xexpose;
+                  XCopyArea(plat().display, h->pixmap, h->window, h->gc,
+                     e.x, e.y, e.width, e.height, e.x, e.y);
+                  if (e.count == 0)
+                     XFlush(plat().display);
+                  break;
+               }
+#endif
+               if (ev.xexpose.count != 0)
+                  break;
+               if (!h->opened)
+               {
+                  int w = 0, hgt = 0;
+                  window_pixel_size(h->window, w, hgt);
+                  h->size = {float(w / h->scale), float(hgt / h->scale)};
+                  h->opened = true;
+                  view.on_open({h->size.x, h->size.y}, float(h->scale));
+               }
+               do_render(view);
+               break;
+            }
+
+            case ConfigureNotify:
+            {
+               // Per-monitor HiDPI: if the window moved to a monitor with a
+               // different scale, keep the logical size and resize the X window
+               // to logical×scale (so it stays the right physical size). The
+               // resize triggers another ConfigureNotify at the same scale,
+               // which falls into the else-branch — no loop.
+               double new_scale = window_scale(h->window);
+               if (new_scale != h->scale)
+               {
+                  h->scale = new_scale;
+                  int pw = int(std::lround(h->size.x * new_scale));
+                  int ph = int(std::lround(h->size.y * new_scale));
+                  XResizeWindow(plat().display, h->window, pw, ph);
+                  create_backing(h, pw, ph);   // uses h->scale for device scale
+                  view.on_scale_change(float(new_scale));
+                  do_render(view);
+               }
+               else
+               {
+                  int w = ev.xconfigure.width;
+                  int hgt = ev.xconfigure.height;
+                  if (w != h->pix_w || hgt != h->pix_h)
+                  {
+                     create_backing(h, w, hgt);
+                     h->size = {float(w / h->scale), float(hgt / h->scale)};
+                     if (h->opened)
+                        view.on_size_change({h->size.x, h->size.y});
+                     do_render(view);   // repaint at the new size, no stale frame
+                  }
+               }
+               break;
+            }
+
+            case ButtonPress:
+            case ButtonRelease:
+            {
+               unsigned b = ev.xbutton.button;
+               if (b >= 4 && b <= 7)
+               {
+                  if (ev.type != ButtonPress)
+                     break;
+                  // Time-based acceleration (mirrors the GTK host): faster
+                  // gestures send larger steps. elapsed clamped so step ≤ 10.
+                  auto elapsed = std::max<float>(10.0f, ev.xbutton.time - h->scroll_time);
+                  h->scroll_time = ev.xbutton.time;
+                  float step = 100.0f / elapsed;
+                  float dx = 0, dy = 0;
+                  switch (b)
+                  {
+                     case 4: dy = +step; break;
+                     case 5: dy = -step; break;
+                     case 6: dx = +step; break;
+                     case 7: dx = -step; break;
+                  }
+                  view.scroll({dx, dy}, logical_pos(h, ev.xbutton.x, ev.xbutton.y));
+                  break;
+               }
+
+               mouse_button btn;
+               if (get_button(ev.xbutton, btn, h))
+               {
+                  h->cursor_position = btn.pos;
+                  view.click(btn);
+               }
+               break;
+            }
+
+            case MotionNotify:
+            {
+               point pos = logical_pos(h, ev.xmotion.x, ev.xmotion.y);
+               h->cursor_position = pos;
+
+               mouse_button btn;
+               btn.modifiers = get_mods(ev.xmotion.state);
+               btn.num_clicks = h->click_count;
+               btn.pos = pos;
+
+               if (ev.xmotion.state & Button1Mask)
+                  { btn.down = true; btn.state = mouse_button::left;   view.drag(btn); }
+               else if (ev.xmotion.state & Button2Mask)
+                  { btn.down = true; btn.state = mouse_button::middle; view.drag(btn); }
+               else if (ev.xmotion.state & Button3Mask)
+                  { btn.down = true; btn.state = mouse_button::right;  view.drag(btn); }
+               else
+                  view.cursor(pos, cursor_tracking::hovering);
+               break;
+            }
+
+            case EnterNotify:
+               h->cursor_position = logical_pos(h, ev.xcrossing.x, ev.xcrossing.y);
+               plat().cursor_window = h->window;
+               apply_cursor(h->window, plat().cursor);
+               view.cursor(h->cursor_position, cursor_tracking::entering);
+               break;
+
+            case LeaveNotify:
+               h->cursor_position = logical_pos(h, ev.xcrossing.x, ev.xcrossing.y);
+               if (plat().cursor_window == h->window)
+                  plat().cursor_window = 0;
+               view.cursor(h->cursor_position, cursor_tracking::leaving);
+               break;
+
+            case FocusIn:
+               if (h->xic)
+                  XSetICFocus(h->xic);
+               view.begin_focus();
+               break;
+
+            case FocusOut:
+               if (h->xic)
+                  XUnsetICFocus(h->xic);
+               view.end_focus();
+               break;
+
+            case KeyPress:
+            {
+               h->modifiers = get_mods(ev.xkey.state);
+
+               char buf[64];
+               KeySym keysym = NoSymbol;
+               int len = 0;
+               Status status = XLookupNone;
+               if (h->xic)
+                  len = Xutf8LookupString(h->xic, &ev.xkey, buf, sizeof(buf), &keysym, &status);
+               else
+                  len = XLookupString(&ev.xkey, buf, sizeof(buf), &keysym, nullptr);
+
+               // The key is the one without Shift, as on the other hosts: the
+               // keysym looked up above is the shifted one, for the text.
+               KeySym const unshifted = XLookupKeysym(&ev.xkey, 0);
+               if (auto key = translate_key(unshifted); key != key_code::unknown)
+                  handle_key(view, h->keys, {key, key_action::press, h->modifiers});
+
+               if (len > 0 && (status == XLookupChars || status == XLookupBoth || !h->xic))
+               {
+                  int i = 0;
+                  while (i < len)
+                  {
+                     std::uint32_t cp = 0;
+                     int n = next_codepoint(buf + i, len - i, cp);
+                     if (n == 0)
+                        break;
+                     i += n;
+                     if (cp >= 0x20 && cp != 0x7F)
+                        view.text({cp, h->modifiers});
+                  }
+               }
+               break;
+            }
+
+            case KeyRelease:
+            {
+               // Filter X11 auto-repeat (release immediately followed by a
+               // press of the same key is synthetic).
+               if (XPending(plat().display))
+               {
+                  XEvent next;
+                  XPeekEvent(plat().display, &next);
+                  if (next.type == KeyPress &&
+                      next.xkey.window == ev.xkey.window &&
+                      next.xkey.keycode == ev.xkey.keycode &&
+                      (next.xkey.time - ev.xkey.time) < 2)
+                     break;
+               }
+               h->modifiers = get_mods(ev.xkey.state);
+               KeySym keysym = XLookupKeysym(&ev.xkey, 0);
+               if (auto key = translate_key(keysym); key != key_code::unknown)
+                  handle_key(view, h->keys, {key, key_action::release, h->modifiers});
+               break;
+            }
+
+            case ClientMessage:
+            {
+               Atom mt = ev.xclient.message_type;
+               auto& p = plat();
+               if (mt == p.a_xdnd_enter || mt == p.a_xdnd_position ||
+                   mt == p.a_xdnd_leave || mt == p.a_xdnd_drop)
+                  handle_xdnd(view, h, ev.xclient);
+               break;
+            }
+
+            default:
+               break;
+         }
+      }
+   }
+
+   ////////////////////////////////////////////////////////////////////////////
+   // Event-pump entry points (used by app::run() or an external host loop)
+   ////////////////////////////////////////////////////////////////////////////
+   void dispatch_event(XEvent& ev)
+   {
+      // The input method takes the events it needs, a dead key's for
+      // instance, and gives back the composed text later.
+      if (XFilterEvent(&ev, None))
+         return;
+
+      // Clipboard selection traffic (targets the hidden clip window).
+      if (ev.type == SelectionRequest)
+      {
+         handle_selection_request(ev.xselectionrequest);
+         return;
+      }
+      if (ev.type == SelectionClear)
+      {
+         // Someone else's now, unless we took it back since.
+         auto& p = plat();
+         if (ev.xselectionclear.selection == p.a_clipboard
+            && XGetSelectionOwner(p.display, p.a_clipboard) != p.clip_window)
+            p.clip_data.clear();
+         return;
+      }
+      if (ev.type == PropertyNotify && !plat().incr_transfers.empty())
+         handle_incr_progress(ev.xproperty);
+
+      // Window-close protocol.
+      if (ev.type == ClientMessage &&
+          Atom(ev.xclient.data.l[0]) == plat().wm_delete)
+      {
+         fire_close(ev.xclient.window);
+         return;
+      }
+
+      if (base_view* view = find_view(ev.xany.window))
+         handle_view_event(*view, ev);
+   }
+
+   void poll_views()
+   {
+      // A refresh only marks an area. Each view is drawn here, once, after
+      // its posted work has run, however many refreshes that work asked
+      // for.
+      for (auto& [w, view] : plat().views)
+      {
+         view->poll();
+         if (platform_access::get_host_view(*view)->has_dirty)
+            do_render(*view);
+      }
+   }
+
+   ////////////////////////////////////////////////////////////////////////////
+   // base_view
+   ////////////////////////////////////////////////////////////////////////////
+   namespace
+   {
+      // Everything a view needs from the window it renders into, whoever
+      // made that window: input, text entry, drag and drop, the cursor, the
+      // back buffer, and a place in the registry dispatch_event looks in.
+      void open_view(base_view* self, host_view* _view)
+      {
+         Display* d = get_display();
+
+         if (XIM xim = get_xim())
+      {
+         _view->xic = XCreateIC(xim,
+            XNInputStyle, XIMPreeditNothing | XIMStatusNothing,
+            XNClientWindow, _view->window,
+            XNFocusWindow, _view->window,
+            nullptr);
+         }
+
+         XSelectInput(d, _view->window,
+         ExposureMask | StructureNotifyMask |
+         ButtonPressMask | ButtonReleaseMask | PointerMotionMask |
+         KeyPressMask | KeyReleaseMask |
+         EnterWindowMask | LeaveWindowMask | FocusChangeMask);
+
+      // Advertise XDND support so drag sources will target this window.
+      {
+         long version = the_xdnd_version;
+         XChangeProperty(d, _view->window, plat().a_xdnd_aware, XA_ATOM, 32,
+            PropModeReplace, (unsigned char*)&version, 1);
+      }
+
+      // Default themed arrow cursor (avoids the tiny core X cursor on enter).
+      apply_cursor(_view->window, cursor_type::arrow);
+
+#if defined(ARTIST_CAIRO)
+      _view->gc = XCreateGC(d, _view->window, 0, nullptr);
+#elif defined(ARTIST_SKIA)
+      init_egl_skia(_view);
+#endif
+      int w = 0, hgt = 0;
+      window_pixel_size(_view->window, w, hgt);
+      _view->size = {float(w / _view->scale), float(hgt / _view->scale)};
+      create_backing(_view, w, hgt);
+
+      register_view(_view->window, self);
+
+      XClearArea(d, _view->window, 0, 0, 0, 0, True);
+      XFlush(d);
+      }
+   }
+
+   base_view::base_view(extent /*size_*/)
+    : _view(new host_view)
+   {
+      CYCFI_ASSERT(false, "Offscreen base_view unimplemented on X11");
+   }
+
+   // Adopt a host_view already set up by whoever made it.
+   base_view::base_view(host_view_handle h)
+    : _view(h)
+   {
+   }
+
+   base_view::base_view(host_window_handle h)
+    : _view(new host_view)
+   {
+      _view->window = get_window(*h);
+      _view->scale = window_scale(_view->window);
+      open_view(this, _view);
+   }
+
+   // A view inside a window someone else owns, a plugin host's for instance:
+   // a child window filling the parent, set up as any view is, and destroyed
+   // with the view. The parent is an X11 Window.
+   base_view::base_view(unsigned long parent)
+    : _view(new host_view)
+   {
+      Display* d = get_display();
+      int w = 1, hgt = 1;
+      XWindowAttributes a;
+      if (XGetWindowAttributes(d, parent, &a))
+      {
+         w = a.width > 0 ? a.width : 1;
+         hgt = a.height > 0 ? a.height : 1;
+      }
+
+      _view->window = XCreateSimpleWindow(d, parent, 0, 0, w, hgt, 0, 0, 0);
+      _view->owns_window = true;
+      _view->scale = window_scale(_view->window);
+
+      // XEmbed: the protocol version spoken, and that the child is mapped.
+      {
+         Atom info = XInternAtom(d, "_XEMBED_INFO", False);
+         long data[2] = {0, 1};
+         XChangeProperty(d, _view->window, info, info, 32, PropModeReplace,
+            (unsigned char*)data, 2);
+      }
+
+      open_view(this, _view);
+      XMapWindow(d, _view->window);
+      XFlush(d);
+   }
+
+   base_view::~base_view()
+   {
+      Display* d = get_display();
+      unregister_view(_view->window);
+      if (_view->xic)
+         XDestroyIC(_view->xic);
+#if defined(ARTIST_CAIRO)
+      if (_view->surface)
+         cairo_surface_destroy(_view->surface);
+      if (_view->pixmap)
+         XFreePixmap(d, _view->pixmap);
+      if (_view->gc)
+         XFreeGC(d, _view->gc);
+#elif defined(ARTIST_SKIA)
+      _view->skia_surface.reset();
+      _view->ctx.reset();
+      _view->xface.reset();
+      if (_view->egl_surface != EGL_NO_SURFACE)
+         eglDestroySurface(_view->egl_display, _view->egl_surface);
+      if (_view->egl_context != EGL_NO_CONTEXT)
+         eglDestroyContext(_view->egl_display, _view->egl_context);
+      if (_view->egl_display != EGL_NO_DISPLAY)
+         eglTerminate(_view->egl_display);
+#endif
+      // Synced, not just queued: a plugin's host destroys its own window
+      // once the view is gone, and a destroy still in the buffer would then
+      // name a window that no longer exists.
+      if (_view->owns_window)
+      {
+         XDestroyWindow(d, _view->window);
+         XSync(d, False);
+      }
+      delete _view;
+      _view = nullptr;
+   }
+
+   point base_view::cursor_pos() const
+   {
+      return _view->cursor_position;
+   }
+
+   elements::extent base_view::size() const
+   {
+      return {_view->size.x, _view->size.y};
+   }
+
+   // The size is the view's as soon as it is asked for, not when the
+   // ConfigureNotify arrives: whoever asked reads it back first, and a plugin
+   // host sizes its own window from that answer.
+   void base_view::size(elements::extent p)
+   {
+      int const pw = int(std::lround(p.x * _view->scale));
+      int const ph = int(std::lround(p.y * _view->scale));
+      XResizeWindow(get_display(), _view->window, pw, ph);
+      _view->size = {p.x, p.y};
+      if (pw != _view->pix_w || ph != _view->pix_h)
+         create_backing(_view, pw, ph);
+   }
+
+   void base_view::refresh()
+   {
+      invalidate(_view, {0, 0, _view->size.x, _view->size.y});
+   }
+
+   void base_view::refresh(rect area)
+   {
+      invalidate(_view, area);
+   }
+
+   void base_view::accept_drop_types(mime_types const& types)
+   {
+      _drop_types = types;
+   }
+
+   // The input method's windows are not placed at the caret on this
+   // host yet.
+   void base_view::text_caret(rect /* bounds */)
+   {
+   }
+}

@@ -1,5 +1,5 @@
 /*=============================================================================
-   Copyright (c) 2016-2020 Joel de Guzman
+   Copyright (c) 2016-2023 Joel de Guzman
 
    Distributed under the MIT License (https://opensource.org/licenses/MIT)
 =============================================================================*/
@@ -10,7 +10,7 @@
 
 namespace elements = cycfi::elements;
 
-namespace cycfi { namespace elements
+namespace cycfi::elements
 {
    // UTF8 conversion utils defined in base_view.cpp
 
@@ -26,6 +26,7 @@ namespace cycfi { namespace elements
       {
          window*     wptr = nullptr;
          view_limits limits = {};
+         UINT        dpi = 96;
       };
 
       window_info* get_window_info(HWND hwnd)
@@ -43,25 +44,28 @@ namespace cycfi { namespace elements
       void disable_minimize(HWND hwnd)
       {
          SetWindowLongW(hwnd, GWL_STYLE,
-            GetWindowLongW(hwnd, GWL_STYLE) & ~WS_MINIMIZEBOX);
+         GetWindowLongW(hwnd, GWL_STYLE) & ~WS_MINIMIZEBOX);
+         SetWindowPos(hwnd, nullptr, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED);
       }
 
+      [[maybe_unused]]
       void disable_maximize(HWND hwnd)
       {
          SetWindowLongW(hwnd, GWL_STYLE,
-            GetWindowLongW(hwnd, GWL_STYLE) & ~WS_MAXIMIZEBOX);
+         GetWindowLongW(hwnd, GWL_STYLE) & ~WS_MAXIMIZEBOX);
+         SetWindowPos(hwnd, nullptr, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED);
       }
 
       void disable_resize(HWND hwnd)
       {
          SetWindowLongW(hwnd, GWL_STYLE,
-            GetWindowLongW(hwnd, GWL_STYLE) & ~WS_SIZEBOX);
-         disable_maximize(hwnd);
+         GetWindowLongW(hwnd, GWL_STYLE) & ~WS_SIZEBOX & ~WS_MAXIMIZEBOX);
+         SetWindowPos(hwnd, nullptr, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED);
       }
 
       LRESULT on_close(window* win)
       {
-         if (win)
+         if (win && win->on_close)
             win->on_close();
          return 0;
       }
@@ -122,10 +126,38 @@ namespace cycfi { namespace elements
          auto* info = get_window_info(hwnd);
          switch (message)
          {
-            case WM_CLOSE: return on_close(info->wptr);
+            case WM_CLOSE:
+               ShowWindow(hwnd, SW_HIDE);
+               return on_close(info->wptr);
 
             case WM_DPICHANGED:
-            case WM_SIZE: return on_size(hwnd);
+               if (info)
+               {
+                  // Keep the client's logical size. Windows suggests a window
+                  // rect scaled as a whole, but under per-monitor (v1)
+                  // awareness the frame does not scale, so its suggestion
+                  // gives the client the frame's surplus. Scale the client by
+                  // the DPI ratio and add the frame back; the suggested
+                  // position stays. The resulting WM_SIZE fits the view.
+                  auto const& r = *reinterpret_cast<RECT const*>(lparam);
+                  auto const new_dpi = UINT(LOWORD(wparam));
+                  auto const ratio = float(new_dpi) / info->dpi;
+                  info->dpi = new_dpi;
+
+                  RECT client;
+                  GetClientRect(hwnd, &client);
+                  auto extra = window_frame_size(hwnd);
+                  SetWindowPos(
+                     hwnd, nullptr, r.left, r.top
+                   , int(client.right * ratio + 0.5f) + extra.x
+                   , int(client.bottom * ratio + 0.5f) + extra.y
+                   , SWP_NOZORDER | SWP_NOACTIVATE
+                  );
+               }
+               return 0;
+
+            case WM_SIZE:
+               return on_size(hwnd);
 
             case WM_SIZING:
                if (info)
@@ -141,20 +173,36 @@ namespace cycfi { namespace elements
          return 0;
       }
 
+      // Registered under the module that holds this code, as the view's
+      // class is (see base_view.cpp), so each library that links Elements
+      // into one process gets its own class.
       struct init_window_class
       {
          init_window_class()
          {
+            GetModuleHandleExW(
+               GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+               (LPCWSTR) &handle_event, &module
+            );
+
             WNDCLASSW windowClass = {};
-            windowClass.hbrBackground = nullptr;
+            windowClass.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH); ;
             windowClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
-            windowClass.hInstance = GetModuleHandleW(nullptr);
+            windowClass.hInstance = module;
             windowClass.lpfnWndProc = handle_event;
             windowClass.lpszClassName = L"ElementsWindow";
             windowClass.style = CS_HREDRAW | CS_VREDRAW;
             if (!RegisterClassW(&windowClass))
                MessageBoxW(nullptr, L"Could not register class", L"Error", MB_OK);
          }
+
+         ~init_window_class()
+         {
+            UnregisterClassW(L"ElementsWindow", module);
+         }
+
+         HMODULE module = nullptr;
       };
    }
 
@@ -169,25 +217,44 @@ namespace cycfi { namespace elements
       auto scale = GetDpiForSystem() / 96.0f;
       #endif
 
+      // Without a title, a bare window: no frame at all, as on macOS.
+      DWORD const win_style =
+         (style_ & with_title)? WS_OVERLAPPEDWINDOW : WS_POPUP;
+
       _window = CreateWindowW(
          L"ElementsWindow",
          wname.c_str(),
-         WS_OVERLAPPEDWINDOW,
+         win_style,
          bounds.left * scale, bounds.top * scale,
          bounds.width() * scale, bounds.height() * scale,
-         nullptr, nullptr, nullptr,
+         nullptr, nullptr, init.module,
          nullptr
       );
 
-      auto* info = new window_info{ this };
+      auto* info = new window_info{this};
+      #ifndef ELEMENTS_HOST_ONLY_WIN7
+      info->dpi = GetDpiForWindow(_window);
+      #endif
       SetWindowLongPtrW(_window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(info));
 
-      if (!(style_ & closable))
-         disable_close(_window);
-      if (!(style_ & miniaturizable))
-         disable_minimize(_window);
-      if (!(style_ & resizable))
-         disable_resize(_window);
+      if (style_ & with_title)
+      {
+         if (!(style_ & closable))
+            disable_close(_window);
+         if (!(style_ & miniaturizable))
+            disable_minimize(_window);
+         if (!(style_ & resizable))
+            disable_resize(_window);
+      }
+
+      // Sets the app icon for the window to show on the titlebar.
+      // The IDI_ELEMENTS_APP_ICON icon id should be defined in a resource file.
+      HICON hIcon = LoadIcon(GetModuleHandle(nullptr), TEXT("IDI_ELEMENTS_APP_ICON"));
+      if (hIcon)
+         ::SendMessage(_window, WM_SETICON, ICON_BIG, (LPARAM)hIcon);
+
+      // The bounds give the content's size: the frame goes around it
+      size({bounds.width(), bounds.height()});
 
       ShowWindow(_window, SW_RESTORE);
    }
@@ -198,24 +265,27 @@ namespace cycfi { namespace elements
       DeleteObject(_window);
    }
 
+   // The size is the content's, the client area, the frame left out, as
+   // on every host
    point window::size() const
    {
       auto scale = get_scale_for_window(_window);
-      RECT frame;
-      GetWindowRect(_window, &frame);
+      RECT content;
+      GetClientRect(_window, &content);
       return {
-         float((frame.right - frame.left) / scale),
-         float((frame.bottom - frame.top) / scale)
+         float((content.right - content.left) / scale),
+         float((content.bottom - content.top) / scale)
       };
    }
 
    void window::size(point const& p)
    {
       auto scale = get_scale_for_window(_window);
+      auto extra = window_frame_size(_window);
       RECT frame;
       GetWindowRect(_window, &frame);
-      frame.right = frame.left + (p.x * scale);
-      frame.bottom = frame.top + (p.y * scale);
+      frame.right = frame.left + extra.x + LONG(p.x * scale);
+      frame.bottom = frame.top + extra.y + LONG(p.y * scale);
       constrain_size(
          _window, frame, get_window_info(_window)->limits);
 
@@ -248,7 +318,7 @@ namespace cycfi { namespace elements
       auto scale = get_scale_for_window(_window);
       RECT frame;
       GetWindowRect(_window, &frame);
-      return { float(frame.left / scale), float(frame.top / scale) };
+      return {float(frame.left / scale), float(frame.top / scale)};
    }
 
    void window::position(point const& p)
@@ -264,5 +334,5 @@ namespace cycfi { namespace elements
          true // repaint
       );
    }
-}}
+}
 

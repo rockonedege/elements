@@ -1,5 +1,5 @@
 /*=============================================================================
-   Copyright (c) 2016-2020 Joel de Guzman
+   Copyright (c) 2016-2023 Joel de Guzman
 
    Distributed under the MIT License [ https://opensource.org/licenses/MIT ]
 =============================================================================*/
@@ -10,5 +10,6 @@
 #include <elements/window.hpp>
 #include <elements/view.hpp>
 #include <elements/element.hpp>
+#include <elements/model.hpp>
 
 #endif

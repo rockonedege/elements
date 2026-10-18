@@ -2,67 +2,35 @@
 
 [![CMake Build Matrix](https://github.com/cycfi/elements/workflows/Build/badge.svg)](https://github.com/cycfi/elements/actions?query=workflow%3ABuild)
 
-![alt Photon Sampler](https://cycfi.github.io/assets/img/elements/photon_sampler.jpg)
+[![Build, by platform and backend](https://cycfi.github.io/elements/status/build.svg)](https://github.com/cycfi/elements/actions/workflows/build.yml)
+
 
 ## Introduction
 
-Elements is a lightweight, fine-grained, resolution independent, modular GUI library. 
-Elements is designed with these requirements in mind:
+![alt Elements Sampler](https://cycfi.github.io/assets/img/elements/photon_sampler.jpg)
 
-1. It should be open source with a liberal, non-viral license.
-2. It should be usable in any application and should play well with other GUI
-   libraries and frameworks.
-3. Corollary to the second requirement is that it can also be used to develop
-   plugins. It should not own the event loop and should be able to co-exist
-   with components within a plugin host such as VST and AU.
-4. It should be resolution independent and allow for HDPI displays.
-5. Should not rely on a “visual” GUI editor or code generator.
-6. It should have a declarative API using modern C++. Declarative C++ code
-   tells you *what* rather than *how* (imperative). The GUI should be
-   declared in C++ code.
-7. Keep it simple. Make it easy to use right out of the box, with a lot of examples.
-8. Porting to a new host target should be as easy as possible, requiring 
-   porting of only a few files.
+Elements is a lightweight, fine-grained, resolution-independent, extremely modular GUI library. The library is written using modern C++20 language features. It has a declarative interface with a sensible and easy-to-use Domain Specific Embedded Languages (DSEL) syntax for constructing the GUI elements. A declarative description of the GUI is written exclusively in C++, and therefore, there is no need for an external visual GUI editor or code generator.
 
-Elements, is extremely lightweight… and modular. You compose very
-fine-grained, flyweight “elements” to form deep element hierarchies using a
-declarative interface with heavy emphasis on reuse.
+Elements is embeddable, meaning you can embed it in any application, and it will play well with other GUI libraries and frameworks. This also implies that you can utilize it for the creation of plugins. It does not own the event loop and is able to co-exist with components within a plugin host, such as [VST](https://en.wikipedia.org/wiki/Virtual_Studio_Technology) and [AU](https://en.wikipedia.org/wiki/Audio_Units). Porting to a new host target is straightforward, requiring the porting of only a few files.
+
+Elements is distributed under the liberal and non-viral MIT License.
 
 ## Status
 
-Please take note that Elements is still very much in flux as we are inching
-closer towards a version 1.0 release. The API and code is still undergoing
-continuous changes, and for that matter, Elements is not yet "production
-ready". But that should not prevent you from using Elements now! It is
-already in a very usable form, and more people using it will ultimately make
-it more robust when bugs are reported and fixed. API and usability matters
-and I very much welcome suggestions and contributions. Hey, this is an open
-source project! If you like the design, concepts and ideas behind Elements, I
-very much welcome collaboration.
+Elements 1.0 is out: the first versioned release, built on Artist 1.0. Releases are tagged from here on, `master` is the latest release, and `develop` is where the next one is made. API and usability matter, and I very much welcome suggestions and contributions. Hey, this is an open source project! If you like the design, concepts and ideas behind Elements, I very much welcome collaboration.
 
 ## News
 
-- 19 January 2021: Added Child Windows to develop (will merge to master in due time). [See Example](https://bit.ly/3iLMJt2).
-- 25 September 2020: Added [thumbwheels](https://github.com/cycfi/elements/issues/231).
-- 12 September 2020: Linux [Artist 2D Canvas Library](https://github.com/cycfi/artist)
-  port feature complete.
-- 10 September 2020: Windows [Artist 2D Canvas Library](https://github.com/cycfi/artist)
-  port feature complete.
-- 7 September 2020: MacOS [Artist 2D Canvas Library](https://github.com/cycfi/artist)
-  port feature complete.
-- 22 June 2020: Removed dependency on Boost. This requires some API changes to
-  the `app` with additional arguments. See examples.
-- 26 May 2020: Introducing the [Artist 2D Canvas
-  Library](https://github.com/cycfi/artist). The Artist library will
-  eventually replace Element's 2d canvas implementation.
-- 23 May 2020: Work in progress `notebook` gallery factory (`notebook` branch).
-- 8 April 2020: Simplified installation (Infra and Json are now header-only submodules)
-- 11 March 2020: Added [Layout documentation](http://cycfi.github.io/elements/layout).
-- 3 March 2020: Added [Design Aspects documentation](http://cycfi.github.io/elements/aspects).
-- 23 February 2020: Setup and Installation guide updated for Windows and Linux.
-- 22 February 2020: Improved font support
-- 01 September 2019: Linux port completed
-- 12 August 2019: Windows port completed
+**October 18, 2026:**
+Elements 1.0.0 is released, built on Artist 1.0.0. Each platform uses its native backend by default: Direct2D on Windows, Quartz 2D on macOS and Cairo on Linux. Build with `-DELEMENTS_SKIA=ON` for Skia, which comes as a prebuilt bundle. The [documentation](https://cycfi.github.io/elements/elements/v1.0/index.html) covers setup, design and every element.
+
+**June 20, 2026:**
+The `develop` branch is now a unified codebase built on the upgraded [Artist](https://github.com/cycfi/artist/tree/develop) backend, supporting **Skia, Quartz2D, and Cairo**, with HarfBuzz text shaping, Retina/HiDPI support, correct shadow rendering, and significant performance improvements across Linux, Windows, and macOS. Skia is the default backend on Windows/Linux and Quartz2D on macOS; build with `-DELEMENTS_CAIRO=ON` for the lightweight Cairo backend. Skia no longer needs a slow from-source build: prebuilt binaries are fetched automatically (see the [setup guide](https://cycfi.github.io/elements/elements/v1.0/setup.html)). Follow [this link](news.md) for details.
+
+**March 28, 2024:**
+I decided to bring the Cairo-based backend of Elements back into the fold. It will be the master branch once again. The Skia backend version is still very much in active development, but it still needs a lot of testing and work, especially with the way Skia is integrated.
+
+Follow [this link](news.md) for details.
 
 ## Discord
 
@@ -70,14 +38,16 @@ Feel free to join the [discord channel](https://discord.gg/NJkadSx) for discussi
 
 ## Documentation
 
-Documentation is work in progress. Stay tuned...
+The documentation is published at <https://cycfi.github.io/elements/>.
 
-1. [Gallery](http://cycfi.github.io/elements/gallery)
-2. [Setup and Installation](http://cycfi.github.io/elements/setup)
-3. [Design Aspects](http://cycfi.github.io/elements/aspects)
-4. [Layout](http://cycfi.github.io/elements/layout)
+1. [Gallery](https://cycfi.github.io/elements/elements/v1.0/gallery.html)
+2. [Setup and Installation](https://cycfi.github.io/elements/elements/v1.0/setup.html)
+3. [Design Aspects](https://cycfi.github.io/elements/elements/v1.0/aspects.html)
+4. [Layout](https://cycfi.github.io/elements/elements/v1.0/layout.html)
 
 ## <a name="jdeguzman"></a>About the Author
+
+<img align="right" src="https://github.com/cycfi/elements/blob/assets/images/joel.jpg?raw=true" width="200">
 
 Joel got into electronics and programming in the 80s because almost
 everything in music, his first love, is becoming electronic and digital.
@@ -86,8 +56,7 @@ playing distortion-laden rock guitar, composes and produces his own music in
 his home studio.
 
 Joel de Guzman is the principal architect and engineer at [Cycfi
-Research](https://www.cycfi.com/) and a consultant at [Ciere
-Consulting](https://ciere.com/). He is a software engineer specializing in
+Research](https://www.cycfi.com/). He is a software engineer specializing in
 advanced C++ and an advocate of Open Source. He has authored a number of
 highly successful Open Source projects such as
 [Boost.Spirit](http://tinyurl.com/ydhotlaf),
@@ -98,5 +67,5 @@ peer-reviewed, Open Source, collaborative development effort.
 
 -------------------------------------------------------------------------------
 
-*Copyright (c) 2014-2020 Joel de Guzman. All rights reserved.*
+*Copyright (c) 2014-2026 Joel de Guzman. All rights reserved.*
 *Distributed under the [MIT License](https://opensource.org/licenses/MIT)*

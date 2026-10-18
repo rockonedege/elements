@@ -1,5 +1,5 @@
 /*=============================================================================
-   Copyright (c) 2016-2020 Joel de Guzman
+   Copyright (c) 2016-2023 Joel de Guzman
 
    Distributed under the MIT License [ https://opensource.org/licenses/MIT ]
 =============================================================================*/
@@ -9,11 +9,16 @@
 #include <elements/element/composite.hpp>
 #include <algorithm>
 
-namespace cycfi { namespace elements
+namespace cycfi::elements
 {
-   ////////////////////////////////////////////////////////////////////////////
-   // Layer
-   ////////////////////////////////////////////////////////////////////////////
+   /**
+    * \class layer_element
+    *
+    * \brief
+    *    A class which represents an element in a layer. The layer_element is
+    *    a composite that allows groups of elements to be placed in the
+    *    z-axis. Higher-level elements obscure or hide lower-level elements.
+    */
    class layer_element : public composite_base
    {
    public:
@@ -23,33 +28,58 @@ namespace cycfi { namespace elements
       void                    draw(context const& ctx) override;
       hit_info                hit_element(context const& ctx, point p, bool control) const override;
       rect                    bounds_of(context const& ctx, std::size_t index) const override;
-      void                    begin_focus() override;
       bool                    reverse_index() const override { return true; }
+      std::string             class_name() const override;
 
       using composite_base::focus;
 
    private:
 
-      void                    focus_top();
       point                   _previous_size;
    };
 
+   /**
+    * \brief
+    *    `layer_composite` is a composite with indeterminate (dynamic)
+    *    number of elements
+    */
    using layer_composite = vector_composite<layer_element>;
 
-   template <typename... E>
+   /**
+    * \brief
+    *    Create a layer from provided elements. The layer contains group of
+    *    elements placed in z-axis. Higher-level elements obscure or hide
+    *    lower-level elements.
+    *
+    * \tparam E
+    *    Variadic template parameter for the types of the elements.
+    *
+    * \param elements
+    *    The elements to be added to the layer (a parameter pack).
+    *
+    * @return
+    *    A reverse layer composite of the provided elements (top-most element
+    *    last).
+    */
+   template <concepts::Element... E>
    inline auto layer(E&&... elements)
    {
       using composite = array_composite<sizeof...(elements), layer_element>;
       using container = typename composite::container_type;
       composite r{};
-      r = container{{ share(std::forward<E>(elements))... }};
+      r = container{{share(std::forward<E>(elements))...}};
       std::reverse(r.begin(), r.end());
       return r;
    }
 
-   ////////////////////////////////////////////////////////////////////////////
-   // Deck
-   ////////////////////////////////////////////////////////////////////////////
+   /**
+    * \class deck_element
+    *
+    * \brief
+    *    Represents an element in a deck, which inherits from the
+    *    `layer_element` class. Elements are placed in the z-axis. Unlike
+    *    layers, only the selected element is active (top-most by default).
+    */
    class deck_element : public layer_element
    {
    public:
@@ -59,31 +89,57 @@ namespace cycfi { namespace elements
 
       void                 draw(context const& ctx) override;
       void                 refresh(context const& ctx, element& element, int outward = 0) override;
+      void                 in_context_do(context const& ctx, element& e, context_function f) override;
       hit_info             hit_element(context const& ctx, point p, bool control) const override;
-      void                 begin_focus() override;
+      bool                 key(context const& ctx, key_info k) override;
+      bool                 text(context const& ctx, text_info info) override;
+      bool                 wants_focus() const override;
+      void                 begin_focus(focus_request req) override;
+      bool                 hotkey(context const& ctx, key_info k) override;
 
       using element::refresh;
       using composite_base::focus;
 
       void                 select(std::size_t index);
       std::size_t          selected() const { return _selected_index; }
+      std::string          class_name() const override;
 
    private:
 
       std::size_t          _selected_index;
    };
 
+   /**
+    * \brief
+    *    `deck_composite` is a composite with indeterminate (dynamic)
+    *    number of elements
+    */
    using deck_composite = vector_composite<deck_element>;
 
-   template <typename... E>
+   /**
+    * \brief
+    *    Create a deck from provided elements. The deck contains a group of
+    *    elements placed in z-axis. Unlike layers, only the selected element
+    *    is active (top-most by default).
+    *
+    * \tparam E
+    *    Variadic template parameter for the types of the elements.
+    *
+    * \param elements
+    *    The elements to be added to the deck (a parameter pack).
+    *
+    * @return
+    *    A deck composite of the provided elements.
+    */
+   template <concepts::Element... E>
    inline auto deck(E&&... elements)
    {
       using composite = array_composite<sizeof...(elements), deck_element>;
       using container = typename composite::container_type;
       composite r{};
-      r = container{{ share(std::forward<E>(elements))... }};
+      r = container{{share(std::forward<E>(elements))...}};
       return r;
    }
-}}
+}
 
 #endif
